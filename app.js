@@ -111,13 +111,29 @@ function updateScholarLink(kws) {
 }
 
 /* ---------- 검색 소스 ---------- */
-async function searchEpmc(kw, o) {
+// 각 검색 함수는 (키워드, 옵션, 이어받을 위치)를 받아 결과 배열을 돌려준다.
+// 배열에 total(그 소스의 전체 검색 건수)과 next(다음 묶음을 받을 위치, 없으면 null)를 붙인다.
+const MAX_OFFSET = 10000; // 대부분의 API가 1만 건 이후로는 넘겨 보기를 막는다
+function paged(list, total, next) {
+  list.total = +total || 0;
+  list.next = next ?? null;
+  return list;
+}
+const nextOffset = (offset, got, total, cap = MAX_OFFSET) => {
+  const n = offset + got;
+  return got > 0 && n < total && n < cap ? n : null;
+};
+
+async function searchEpmc(kw, o, cur) {
   let q = `"${kw}"`;
   if (o.oaOnly) q += ' AND OPEN_ACCESS:y';
   if (o.from || o.to) q += ` AND PUB_YEAR:[${o.from || 1800} TO ${o.to || 3000}]`;
-  const url = `https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=${encodeURIComponent(q)}&format=json&resultType=core&pageSize=${o.size}`;
+  const mark = cur || '*';
+  const url = `https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=${encodeURIComponent(q)}&format=json&resultType=core&pageSize=${o.size}&cursorMark=${encodeURIComponent(mark)}`;
   const data = await fetchJson(url);
-  return (data.resultList?.result || []).map(r => {
+  const results = data.resultList?.result || [];
+  const next = results.length && data.nextCursorMark && data.nextCursorMark !== mark ? data.nextCursorMark : null;
+  return paged(results.map(r => {
     const links = [];
     if (r.doi) links.push({ label: 'DOI', url: 'https://doi.org/' + r.doi });
     links.push({ label: 'Europe PMC', url: `https://europepmc.org/article/${r.source}/${r.id}` });
@@ -136,7 +152,7 @@ async function searchEpmc(kw, o) {
       links,
       source: 'Europe PMC',
     };
-  });
+  }), data.hitCount, next);
 }
 
 function invertedToText(inv) {
@@ -146,7 +162,8 @@ function invertedToText(inv) {
   return arr.join(' ');
 }
 
-async function searchOpenAlex(kw, o) {
+async function searchOpenAlex(kw, o, cur) {
+  const offset = cur || 0;
   const filters = ['has_abstract:true'];
   if (o.from) filters.push(`from_publication_date:${o.from}-01-01`);
   if (o.to) filters.push(`to_publication_date:${o.to}-12-31`);
@@ -155,10 +172,12 @@ async function searchOpenAlex(kw, o) {
     search: `"${kw}"`,
     filter: filters.join(','),
     'per-page': String(o.size),
+    page: String(Math.floor(offset / o.size) + 1),
     select: 'id,doi,display_name,publication_year,authorships,primary_location,open_access,ids,cited_by_count,abstract_inverted_index',
   });
   const data = await fetchJson('https://api.openalex.org/works?' + params);
-  return (data.results || []).map(w => {
+  const results = data.results || [];
+  return paged(results.map(w => {
     const doi = (w.doi || '').replace(/^https?:\/\/doi\.org\//i, '').toLowerCase();
     const pmcMatch = String(w.ids?.pmcid || '').match(/PMC\d+/i);
     const links = [];
@@ -183,7 +202,7 @@ async function searchOpenAlex(kw, o) {
       links,
       source: 'OpenAlex',
     };
-  });
+  }), data.meta?.count, nextOffset(offset, results.length, data.meta?.count));
 }
 
 /* ---------- 서울대 학술DB 중 공개 API가 있는 DB ---------- */
@@ -192,18 +211,20 @@ const doiLink = doi => (doi ? [{ label: 'DOI', url: 'https://doi.org/' + doi }] 
 const cleanDoi = d => String(d || '').replace(/^https?:\/\/(dx\.)?doi\.org\//i, '').trim().toLowerCase();
 
 // PubMed (NCBI E-utilities): 검색(esearch) → 서지·초록(efetch XML)
-async function searchPubMed(kw, o) {
+async function searchPubMed(kw, o, cur) {
+  const offset = cur || 0;
   const E = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils';
   let term = `"${kw}"`;
   if (o.from || o.to) { const [a, b] = yearSpan(o); term += ` AND ${a}:${b}[dp]`; }
   if (o.oaOnly) term += ' AND free full text[sb]';
-  const s = await fetchJson(`${E}/esearch.fcgi?db=pubmed&retmode=json&retmax=${o.size}&term=${encodeURIComponent(term)}`);
+  const s = await fetchJson(`${E}/esearch.fcgi?db=pubmed&retmode=json&retmax=${o.size}&retstart=${offset}&term=${encodeURIComponent(term)}`);
   const ids = s.esearchresult?.idlist || [];
-  if (!ids.length) return [];
+  const total = +s.esearchresult?.count || 0;
+  if (!ids.length) return paged([], total, null);
   await sleep(400); // 키 없이 초당 3회 제한
   const xml = new DOMParser().parseFromString(await fetchText(`${E}/efetch.fcgi?db=pubmed&retmode=xml&id=${ids.join(',')}`), 'text/xml');
   const txt = (n, sel) => n.querySelector(sel)?.textContent.trim() || '';
-  return [...xml.querySelectorAll('PubmedArticle')].map(a => {
+  return paged([...xml.querySelectorAll('PubmedArticle')].map(a => {
     const pmid = txt(a, 'MedlineCitation > PMID');
     const doi = cleanDoi(txt(a, 'ArticleIdList > ArticleId[IdType="doi"]'));
     const pmc = txt(a, 'ArticleIdList > ArticleId[IdType="pmc"]');
@@ -223,19 +244,21 @@ async function searchPubMed(kw, o) {
       year: +yr || null, venue: txt(a, 'Journal > Title'), doi, pmcid: pmc, fulltextAvail: !!pmc, isOA: !!pmc,
       cited: 0, abstractRaw: abs, links, source: 'PubMed',
     };
-  });
+  }), total, nextOffset(offset, ids.length, total, 9999));
 }
 
 // PLOS (Solr 검색 API)
-async function searchPlos(kw, o) {
+async function searchPlos(kw, o, cur) {
+  const offset = cur || 0;
   const p = new URLSearchParams({
-    q: `everything:"${kw}"`, rows: String(o.size), wt: 'json',
+    q: `everything:"${kw}"`, rows: String(o.size), start: String(offset), wt: 'json',
     fl: 'id,title_display,author_display,abstract,publication_date,journal,counter_total_all',
   });
   p.append('fq', 'doc_type:full');
   if (o.from || o.to) { const [a, b] = yearSpan(o); p.append('fq', `publication_date:[${a}-01-01T00:00:00Z TO ${b}-12-31T23:59:59Z]`); }
   const d = await fetchJson('https://api.plos.org/search?' + p);
-  return (d.response?.docs || []).map(x => {
+  const docs = d.response?.docs || [];
+  return paged(docs.map(x => {
     const doi = cleanDoi(x.id);
     const authors = x.author_display || [];
     return {
@@ -244,15 +267,17 @@ async function searchPlos(kw, o) {
       cited: 0, abstractRaw: (x.abstract || []).join(' '), links: [...doiLink(doi), { label: 'PLOS', url: `https://journals.plos.org/plosone/article?id=${doi}` }],
       source: 'PLOS',
     };
-  });
+  }), d.response?.numFound, nextOffset(offset, docs.length, d.response?.numFound));
 }
 
 // DOAJ (오픈액세스 저널 논문 검색 API)
-async function searchDoaj(kw, o) {
+async function searchDoaj(kw, o, cur) {
+  const offset = cur || 0;
   let q = `"${kw}"`;
   if (o.from || o.to) { const [a, b] = yearSpan(o); q += ` AND bibjson.year:[${a} TO ${b}]`; }
-  const d = await fetchJson(`https://doaj.org/api/search/articles/${encodeURIComponent(q)}?pageSize=${o.size}`);
-  return (d.results || []).map(r => {
+  const d = await fetchJson(`https://doaj.org/api/search/articles/${encodeURIComponent(q)}?pageSize=${o.size}&page=${Math.floor(offset / o.size) + 1}`);
+  const results = d.results || [];
+  return paged(results.map(r => {
     const b = r.bibjson || {};
     const doi = cleanDoi((b.identifier || []).find(i => i.type === 'doi')?.id);
     const ft = safeUrl((b.link || []).find(l => l.type === 'fulltext')?.url);
@@ -265,17 +290,19 @@ async function searchDoaj(kw, o) {
       year: +b.year || null, venue: b.journal?.title || '', doi, pmcid: '', fulltextAvail: false, isOA: true,
       cited: 0, abstractRaw: b.abstract || '', links, source: 'DOAJ',
     };
-  });
+  }), d.total, nextOffset(offset, results.length, d.total, 1000)); // DOAJ는 1,000건까지만 넘겨 볼 수 있음
 }
 
 // ERIC (미국 교육부 교육학 문헌 API)
-async function searchEric(kw, o) {
+async function searchEric(kw, o, cur) {
+  const offset = cur || 0;
   let q = `"${kw}"`;
   if (o.from || o.to) { const [a, b] = yearSpan(o); q += ` AND publicationdateyear:[${a} TO ${b}]`; }
   if (o.oaOnly) q += ' AND e_fulltextauth:T';
-  const p = new URLSearchParams({ search: q, format: 'json', rows: String(o.size), fields: 'id,title,author,description,publicationdateyear,source,e_fulltextauth' });
+  const p = new URLSearchParams({ search: q, format: 'json', rows: String(o.size), start: String(offset), fields: 'id,title,author,description,publicationdateyear,source,e_fulltextauth' });
   const d = await fetchJson('https://api.ies.ed.gov/eric/?' + p);
-  return (d.response?.docs || []).map(x => {
+  const docs = d.response?.docs || [];
+  return paged(docs.map(x => {
     const authors = x.author || [];
     const links = [{ label: 'ERIC', url: `https://eric.ed.gov/?id=${x.id}` }];
     const hasFt = String(x.e_fulltextauth) === '1' || x.e_fulltextauth === 'T' || x.e_fulltextauth === true;
@@ -285,17 +312,20 @@ async function searchEric(kw, o) {
       year: +x.publicationdateyear || null, venue: x.source || '', doi: '', pmcid: '', fulltextAvail: false, isOA: hasFt,
       cited: 0, abstractRaw: Summ.htmlToText(x.description), links, source: 'ERIC',
     };
-  });
+  }), d.response?.numFound, nextOffset(offset, docs.length, d.response?.numFound));
 }
 
 // CiNii Research (일본 학술정보 OpenSearch)
-async function searchCinii(kw, o) {
-  const p = new URLSearchParams({ q: `"${kw}"`, format: 'json', count: String(o.size) });
+async function searchCinii(kw, o, cur) {
+  const offset = cur || 0;
+  const p = new URLSearchParams({ q: `"${kw}"`, format: 'json', count: String(o.size), start: String(offset + 1) });
   if (o.from) p.set('from', o.from);
   if (o.to) p.set('until', o.to);
   const d = await fetchJson('https://cir.nii.ac.jp/opensearch/articles?' + p);
   const asText = v => (Array.isArray(v) ? v.map(asText).join(' ') : (v && typeof v === 'object' ? (v['@value'] || '') : String(v || '')));
-  return (d.items || []).filter(it => it.title).map(it => {
+  const items = d.items || [];
+  const total = d['opensearch:totalResults'];
+  return paged(items.filter(it => it.title).map(it => {
     const ids = [].concat(it['dc:identifier'] || []);
     const doi = cleanDoi(ids.find(i => /doi/i.test(i['@type'] || ''))?.['@value']);
     const authors = [].concat(it['dc:creator'] || []).map(asText).filter(Boolean);
@@ -306,7 +336,7 @@ async function searchCinii(kw, o) {
       links: [...doiLink(doi), { label: 'CiNii', url: safeUrl(it.link?.['@id'] || it['@id']) }].filter(l => l.url),
       source: 'CiNii',
     };
-  });
+  }), total, nextOffset(offset, items.length, total));
 }
 
 // 검색 소스 목록. fields = 그 DB에서 주로 찾을 수 있는 분야(서울대 학술DB 주제 분류와 DB 설명 기준)
@@ -329,7 +359,7 @@ function renderSources(selectedIds) {
       <input type="checkbox" value="${s.id}" ${sel.has(s.id) ? 'checked' : ''}>
       <span><span class="src-name">${esc(s.name)}</span>
         <span class="src-note">${esc(s.note)}</span>
-        <span class="src-tags">${s.snu ? '<span class="snu">서울대 학술DB</span>' : ''}${s.fields.map(f => `<span>${esc(f)}</span>`).join('')}</span>
+        <span class="src-tags">${s.fields.map(f => `<span>${esc(f)}</span>`).join('')}</span>
       </span>
     </label>`).join('');
   el.fieldChips.innerHTML = FIELD_ORDER.map(f => `<button type="button" data-field="${esc(f)}">${esc(f)}</button>`).join('');
@@ -414,25 +444,69 @@ async function runSearch() {
   el.searchBtn.disabled = true;
   setStatus('검색 중…');
 
-  // 소스끼리는 동시에, 한 소스 안에서는 요청 한도 때문에 키워드를 순서대로 보낸다
-  const jobs = SOURCES.filter(s => srcIds.includes(s.id)).map(async s => {
-    const res = [];
-    for (const kw of kws) {
-      res.push(await s.fn(kw, o).then(list => ({ kw, list }), err => ({ kw, err, src: s.name })));
-    }
-    return res;
-  });
-  const out = (await Promise.all(jobs)).flat();
-  if (seq !== searchSeq) return;
-  const errors = [];
-  for (const r of out) {
-    if (r.err) { errors.push(`${r.src} "${r.kw}" 실패(${r.err.message})`); continue; }
-    r.list.forEach((p, i) => addPaper(p, r.kw, i));
+  // 소스×키워드마다 "피드"를 만들어 두고, 처음 한 묶음을 받는다. 나머지는 페이지를 넘길 때 이어서 받는다.
+  state.searchOpts = o;
+  state.feeds = [];
+  for (const s of SOURCES.filter(x => srcIds.includes(x.id))) {
+    for (const kw of kws) state.feeds.push({ s, kw, cur: undefined, loaded: 0, total: 0, done: false, fails: 0, err: '' });
   }
+  await fetchBatch(seq);
+  if (seq !== searchSeq) return;
   el.searchBtn.disabled = false;
-  state.lastErrors = errors;
-  state.doiLookup = lookupPmcByDoi([...state.papers.values()]);
   render();
+}
+
+// 아직 끝나지 않은 피드에서 다음 묶음을 받는다.
+// 소스끼리는 동시에, 한 소스 안에서는 요청 한도 때문에 키워드를 순서대로 보낸다.
+async function fetchBatch(seq) {
+  const o = state.searchOpts;
+  const groups = {};
+  state.feeds.filter(f => !f.done).forEach(f => (groups[f.s.id] = groups[f.s.id] || []).push(f));
+  await Promise.all(Object.values(groups).map(async feeds => {
+    for (const f of feeds) {
+      try {
+        const list = await f.s.fn(f.kw, o, f.cur);
+        if (seq !== searchSeq) return;
+        list.forEach((p, i) => addPaper(p, f.kw, f.loaded + i));
+        f.loaded += list.length;
+        if (list.total) f.total = list.total;
+        f.cur = list.next;
+        f.done = list.next == null;
+        f.err = '';
+      } catch (err) {
+        f.err = err.message;
+        if (++f.fails >= 2) f.done = true; // 두 번 실패하면 그 피드는 그만 받는다
+      }
+    }
+  }));
+  if (seq !== searchSeq) return;
+  state.lastErrors = state.feeds.filter(f => f.err).map(f => `${f.s.name} "${f.kw}" 실패(${f.err})`);
+  // 새로 들어온 논문만 DOI로 PMC 본문 조회 (앞선 조회와 이어서)
+  const prev = state.doiLookup;
+  const fresh = [...state.papers.values()].filter(p => !p.doiChecked);
+  fresh.forEach(p => { p.doiChecked = true; });
+  state.doiLookup = Promise.all([prev, lookupPmcByDoi(fresh)]);
+}
+
+const hasMore = () => !!state.feeds?.some(f => !f.done);
+let loadingMore = false;
+async function loadMore() {
+  if (loadingMore || !hasMore()) return;
+  loadingMore = true;
+  const seq = searchSeq;
+  setStatus('다음 결과 불러오는 중…');
+  try { await fetchBatch(seq); } finally { loadingMore = false; }
+  if (seq === searchSeq) render();
+}
+
+// 상태줄용: DB가 알려준 전체 검색 건수 (키워드·DB 사이 중복 포함)
+function totalsHtml() {
+  if (!state.feeds?.length) return '';
+  const sum = state.feeds.reduce((a, f) => a + (f.total || 0), 0);
+  const bySrc = {};
+  state.feeds.forEach(f => { bySrc[f.s.name] = (bySrc[f.s.name] || 0) + (f.total || 0); });
+  const tip = Object.entries(bySrc).map(([k, v]) => `${k} ${v.toLocaleString()}건`).join(', ');
+  return ` · <span title="${esc(tip)}">DB 전체 검색 결과 약 ${sum.toLocaleString()}건${hasMore() ? ', 마지막 쪽에서 다음을 누르면 이어서 불러옴' : ''}</span>`;
 }
 
 // PMC 번호가 없는 논문(주로 OpenAlex)을 DOI로 Europe PMC에서 25개씩 묶어 조회 → 본문을 쓸 수 있으면 표시
@@ -522,11 +596,11 @@ function render() {
       frag.appendChild(h);
       appendPage(frag, list, 'kw:' + k, h.id); // 키워드 묶음마다 따로 페이지를 넘긴다
     });
-    setStatus(`논문 ${state.papers.size}편 중 키워드별로 나눠서 보는 중 (중복 포함 ${total}건)` + errHtml);
+    setStatus(`불러온 논문 ${state.papers.size}편 중 키워드별로 나눠서 보는 중 (중복 포함 ${total}건)` + totalsHtml() + errHtml);
   } else {
     const list = filteredPapers();
     const pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
-    setStatus(`${list.length}편 표시 (전체 ${state.papers.size}편${pages > 1 ? ` · ${pages}쪽` : ''})` + errHtml);
+    setStatus(`${list.length}편 표시 (불러온 ${state.papers.size}편${pages > 1 ? ` · ${pages}쪽` : ''})` + totalsHtml() + errHtml);
     appendPage(frag, list, 'merged', 'resultsArea');
   }
   el.results.appendChild(frag);
@@ -554,19 +628,28 @@ function pager(key, page, pages, total, anchorId) {
   for (let n = start; n < end; n++) {
     html += `<button type="button" data-pg="${n}" class="${n === page ? 'on' : ''}" ${n === page ? 'aria-current="page"' : `aria-label="${n + 1}쪽"`}>${n + 1}</button>`;
   }
-  if (page < pages - 1) html += `<button type="button" class="pg-nav" data-pg="${page + 1}">다음</button>`;
+  // 마지막 쪽이어도 DB에 남은 결과가 있으면 "다음"으로 이어서 불러온다
+  if (page < pages - 1 || hasMore()) html += `<button type="button" class="pg-nav" data-pg="${page + 1}">다음</button>`;
+  nav.dataset.count = total;
   nav.title = `${page * PAGE_SIZE + 1}–${Math.min(total, (page + 1) * PAGE_SIZE)} / ${total}편`;
   nav.innerHTML = html;
   nav.dataset.key = key;
   nav.dataset.anchor = anchorId;
   return nav;
 }
-el.results.addEventListener('click', e => {
+el.results.addEventListener('click', async e => {
   const b = e.target.closest('.pager button[data-pg]');
-  if (!b || b.disabled) return;
+  if (!b || b.disabled || b.classList.contains('on')) return;
   const nav = b.closest('.pager');
-  state.pages[nav.dataset.key] = +b.dataset.pg;
+  const target = +b.dataset.pg;
   const anchor = nav.dataset.anchor;
+  // 아직 안 받은 쪽이면 DB에서 다음 묶음을 받아 온다
+  if (target * PAGE_SIZE >= +nav.dataset.count && hasMore()) {
+    b.disabled = true;
+    b.textContent = '불러오는 중…';
+    await loadMore();
+  }
+  state.pages[nav.dataset.key] = target;
   render();
   document.getElementById(anchor === 'resultsArea' ? 'results' : anchor)?.scrollIntoView({ block: 'start' });
 });

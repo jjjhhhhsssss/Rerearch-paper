@@ -74,7 +74,6 @@ a { color: var(--accent); }
 .src-note { color: var(--muted); font-size: .76rem; display: block; line-height: 1.4; }
 .src-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .src-tags span { font-size: .72rem; padding: 0 6px; border-radius: 6px; background: var(--surface-2); color: var(--muted); border: 1px solid var(--border); }
-.src-tags .snu { color: var(--accent); border-color: var(--accent); background: transparent; }
 .opts { display: flex; flex-wrap: wrap; gap: 10px 22px; margin: 14px 0; align-items: center; }
 .opts fieldset { border: 0; padding: 0; margin: 0; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .opts legend { float: left; margin-right: 8px; color: var(--muted); }
