@@ -8,7 +8,7 @@ const SEL_KEY = 'paperSearch.selected.v1';
 const $ = id => document.getElementById(id);
 const el = {
   form: $('searchForm'), kwBox: $('kwBox'), kwChips: $('kwChips'), kwInput: $('kwInput'),
-  srcEpmc: $('srcEpmc'), srcOa: $('srcOa'), yearFrom: $('yearFrom'), yearTo: $('yearTo'), size: $('size'), oaOnly: $('oaOnly'),
+  fieldChips: $('fieldChips'), srcList: $('srcList'), yearFrom: $('yearFrom'), yearTo: $('yearTo'), size: $('size'), oaOnly: $('oaOnly'),
   searchBtn: $('searchBtn'), scholarLink: $('scholarLink'),
   area: $('resultsArea'), empty: $('emptyState'), filterChips: $('filterChips'), matchSeg: $('matchSeg'),
   titleOnly: $('titleOnly'), sort: $('sort'), status: $('status'), results: $('results'),
@@ -55,14 +55,16 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // 응답이 없는 요청이 대기열을 막지 않도록 20초 뒤 끊는다
 const fetchT = (url, ms = 20000) => fetch(url, AbortSignal.timeout ? { signal: AbortSignal.timeout(ms) } : undefined);
 // 429(요청 과다)·5xx는 잠시 기다렸다가 최대 2번 다시 시도
-async function fetchJson(url) {
+async function fetchOk(url) {
   for (let attempt = 0; ; attempt++) {
     const r = await fetchT(url);
-    if (r.ok) return r.json();
+    if (r.ok) return r;
     if ((r.status === 429 || r.status >= 500) && attempt < 2) { await sleep(1500 * (attempt + 1)); continue; }
     throw new Error(r.status === 429 ? '요청 한도 초과, 잠시 후 다시 검색' : `HTTP ${r.status}`);
   }
 }
+const fetchJson = async url => (await fetchOk(url)).json();
+const fetchText = async url => (await fetchOk(url)).text();
 
 /* ---------- 키워드 입력 ---------- */
 function addKeywords(text) {
@@ -184,6 +186,164 @@ async function searchOpenAlex(kw, o) {
   });
 }
 
+/* ---------- 서울대 학술DB 중 공개 API가 있는 DB ---------- */
+const yearSpan = o => [o.from || 1800, o.to || 3000];
+const doiLink = doi => (doi ? [{ label: 'DOI', url: 'https://doi.org/' + doi }] : []);
+const cleanDoi = d => String(d || '').replace(/^https?:\/\/(dx\.)?doi\.org\//i, '').trim().toLowerCase();
+
+// PubMed (NCBI E-utilities): 검색(esearch) → 서지·초록(efetch XML)
+async function searchPubMed(kw, o) {
+  const E = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils';
+  let term = `"${kw}"`;
+  if (o.from || o.to) { const [a, b] = yearSpan(o); term += ` AND ${a}:${b}[dp]`; }
+  if (o.oaOnly) term += ' AND free full text[sb]';
+  const s = await fetchJson(`${E}/esearch.fcgi?db=pubmed&retmode=json&retmax=${o.size}&term=${encodeURIComponent(term)}`);
+  const ids = s.esearchresult?.idlist || [];
+  if (!ids.length) return [];
+  await sleep(400); // 키 없이 초당 3회 제한
+  const xml = new DOMParser().parseFromString(await fetchText(`${E}/efetch.fcgi?db=pubmed&retmode=xml&id=${ids.join(',')}`), 'text/xml');
+  const txt = (n, sel) => n.querySelector(sel)?.textContent.trim() || '';
+  return [...xml.querySelectorAll('PubmedArticle')].map(a => {
+    const pmid = txt(a, 'MedlineCitation > PMID');
+    const doi = cleanDoi(txt(a, 'ArticleIdList > ArticleId[IdType="doi"]'));
+    const pmc = txt(a, 'ArticleIdList > ArticleId[IdType="pmc"]');
+    // 구조화 초록 라벨을 <h4>로 바꿔 두면 summarize.js가 Results/Conclusions를 나눠 읽는다
+    const abs = [...a.querySelectorAll('Abstract > AbstractText')].map(t => {
+      const label = t.getAttribute('Label');
+      return (label ? `<h4>${esc(label)}</h4>` : '') + esc(t.textContent);
+    }).join(' ');
+    const authors = [...a.querySelectorAll('AuthorList > Author')].map(au => [txt(au, 'LastName'), txt(au, 'Initials')].filter(Boolean).join(' ') || txt(au, 'CollectiveName')).filter(Boolean);
+    // 온라인 선공개일(ArticleDate)과 인쇄본 발행일 중 이른 연도 (PubMed 연도 필터와 같은 기준)
+    const yrs = [txt(a, 'Article > ArticleDate Year'), txt(a, 'JournalIssue PubDate Year') || (txt(a, 'JournalIssue PubDate MedlineDate').match(/\d{4}/) || [''])[0]].map(Number).filter(Boolean);
+    const yr = yrs.length ? Math.min(...yrs) : '';
+    const links = [...doiLink(doi), { label: 'PubMed', url: `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` }];
+    if (pmc) links.push({ label: 'PMC 전문', url: `https://www.ncbi.nlm.nih.gov/pmc/articles/${pmc}/` });
+    return {
+      title: txt(a, 'ArticleTitle'), authors: authors.length > 6 ? authors.slice(0, 6).join(', ') + ' 외' : authors.join(', '),
+      year: +yr || null, venue: txt(a, 'Journal > Title'), doi, pmcid: pmc, fulltextAvail: !!pmc, isOA: !!pmc,
+      cited: 0, abstractRaw: abs, links, source: 'PubMed',
+    };
+  });
+}
+
+// PLOS (Solr 검색 API)
+async function searchPlos(kw, o) {
+  const p = new URLSearchParams({
+    q: `everything:"${kw}"`, rows: String(o.size), wt: 'json',
+    fl: 'id,title_display,author_display,abstract,publication_date,journal,counter_total_all',
+  });
+  p.append('fq', 'doc_type:full');
+  if (o.from || o.to) { const [a, b] = yearSpan(o); p.append('fq', `publication_date:[${a}-01-01T00:00:00Z TO ${b}-12-31T23:59:59Z]`); }
+  const d = await fetchJson('https://api.plos.org/search?' + p);
+  return (d.response?.docs || []).map(x => {
+    const doi = cleanDoi(x.id);
+    const authors = x.author_display || [];
+    return {
+      title: Summ.htmlToText(x.title_display), authors: authors.length > 6 ? authors.slice(0, 6).join(', ') + ' 외' : authors.join(', '),
+      year: +(x.publication_date || '').slice(0, 4) || null, venue: x.journal || 'PLOS', doi, pmcid: '', fulltextAvail: false, isOA: true,
+      cited: 0, abstractRaw: (x.abstract || []).join(' '), links: [...doiLink(doi), { label: 'PLOS', url: `https://journals.plos.org/plosone/article?id=${doi}` }],
+      source: 'PLOS',
+    };
+  });
+}
+
+// DOAJ (오픈액세스 저널 논문 검색 API)
+async function searchDoaj(kw, o) {
+  let q = `"${kw}"`;
+  if (o.from || o.to) { const [a, b] = yearSpan(o); q += ` AND bibjson.year:[${a} TO ${b}]`; }
+  const d = await fetchJson(`https://doaj.org/api/search/articles/${encodeURIComponent(q)}?pageSize=${o.size}`);
+  return (d.results || []).map(r => {
+    const b = r.bibjson || {};
+    const doi = cleanDoi((b.identifier || []).find(i => i.type === 'doi')?.id);
+    const ft = safeUrl((b.link || []).find(l => l.type === 'fulltext')?.url);
+    const authors = (b.author || []).map(a => a.name).filter(Boolean);
+    const links = [...doiLink(doi)];
+    if (ft) links.push({ label: '무료 원문', url: ft });
+    links.push({ label: 'DOAJ', url: `https://doaj.org/article/${r.id}` });
+    return {
+      title: Summ.htmlToText(b.title), authors: authors.length > 6 ? authors.slice(0, 6).join(', ') + ' 외' : authors.join(', '),
+      year: +b.year || null, venue: b.journal?.title || '', doi, pmcid: '', fulltextAvail: false, isOA: true,
+      cited: 0, abstractRaw: b.abstract || '', links, source: 'DOAJ',
+    };
+  });
+}
+
+// ERIC (미국 교육부 교육학 문헌 API)
+async function searchEric(kw, o) {
+  let q = `"${kw}"`;
+  if (o.from || o.to) { const [a, b] = yearSpan(o); q += ` AND publicationdateyear:[${a} TO ${b}]`; }
+  if (o.oaOnly) q += ' AND e_fulltextauth:T';
+  const p = new URLSearchParams({ search: q, format: 'json', rows: String(o.size), fields: 'id,title,author,description,publicationdateyear,source,e_fulltextauth' });
+  const d = await fetchJson('https://api.ies.ed.gov/eric/?' + p);
+  return (d.response?.docs || []).map(x => {
+    const authors = x.author || [];
+    const links = [{ label: 'ERIC', url: `https://eric.ed.gov/?id=${x.id}` }];
+    const hasFt = String(x.e_fulltextauth) === '1' || x.e_fulltextauth === 'T' || x.e_fulltextauth === true;
+    if (hasFt) links.push({ label: '무료 원문(PDF)', url: `https://files.eric.ed.gov/fulltext/${x.id}.pdf` });
+    return {
+      title: Summ.htmlToText(x.title), authors: authors.length > 6 ? authors.slice(0, 6).join(', ') + ' 외' : authors.join(', '),
+      year: +x.publicationdateyear || null, venue: x.source || '', doi: '', pmcid: '', fulltextAvail: false, isOA: hasFt,
+      cited: 0, abstractRaw: Summ.htmlToText(x.description), links, source: 'ERIC',
+    };
+  });
+}
+
+// CiNii Research (일본 학술정보 OpenSearch)
+async function searchCinii(kw, o) {
+  const p = new URLSearchParams({ q: `"${kw}"`, format: 'json', count: String(o.size) });
+  if (o.from) p.set('from', o.from);
+  if (o.to) p.set('until', o.to);
+  const d = await fetchJson('https://cir.nii.ac.jp/opensearch/articles?' + p);
+  const asText = v => (Array.isArray(v) ? v.map(asText).join(' ') : (v && typeof v === 'object' ? (v['@value'] || '') : String(v || '')));
+  return (d.items || []).filter(it => it.title).map(it => {
+    const ids = [].concat(it['dc:identifier'] || []);
+    const doi = cleanDoi(ids.find(i => /doi/i.test(i['@type'] || ''))?.['@value']);
+    const authors = [].concat(it['dc:creator'] || []).map(asText).filter(Boolean);
+    return {
+      title: Summ.htmlToText(asText(it.title)), authors: authors.length > 6 ? authors.slice(0, 6).join(', ') + ' 외' : authors.join(', '),
+      year: +(asText(it['prism:publicationDate']).match(/\d{4}/) || [''])[0] || null, venue: asText(it['prism:publicationName']),
+      doi, pmcid: '', fulltextAvail: false, isOA: false, cited: 0, abstractRaw: Summ.htmlToText(asText(it.description)),
+      links: [...doiLink(doi), { label: 'CiNii', url: safeUrl(it.link?.['@id'] || it['@id']) }].filter(l => l.url),
+      source: 'CiNii',
+    };
+  });
+}
+
+// 검색 소스 목록. fields = 그 DB에서 주로 찾을 수 있는 분야(서울대 학술DB 주제 분류와 DB 설명 기준)
+const SOURCES = [
+  { id: 'epmc', name: 'Europe PMC', fn: searchEpmc, on: true, fields: ['생명과학', '의학', '약학', '간호학'], note: '생의학 논문, 오픈액세스 본문 제공' },
+  { id: 'openalex', name: 'OpenAlex', fn: searchOpenAlex, on: true, fields: ['전 분야', '공학', '자연과학', '사회과학', '인문학'], note: '전 분야 학술 문헌 색인' },
+  { id: 'pubmed', name: 'PubMed', fn: searchPubMed, snu: true, fields: ['의학', '간호학', '치의학', '수의학', '생명과학'], note: '의학 분야 대표 서지 DB' },
+  { id: 'plos', name: 'PLOS', fn: searchPlos, snu: true, fields: ['생명과학', '의학', '자연과학'], note: '오픈액세스 과학 저널 (PLOS ONE 등)' },
+  { id: 'doaj', name: 'DOAJ', fn: searchDoaj, snu: true, fields: ['전 분야', '인문학', '사회과학', '자연과학', '공학', '의학'], note: '전 분야 오픈액세스 저널' },
+  { id: 'eric', name: 'ERIC', fn: searchEric, snu: true, fields: ['교육학'], note: '교육학 저널·보고서 (미국 교육부)' },
+  { id: 'cinii', name: 'CiNii', fn: searchCinii, snu: true, fields: ['전 분야', '인문학', '사회과학', '자연과학', '공학', '일본 학술자료'], note: '일본 학술 논문·학위논문 (일본어 검색 가능)' },
+];
+const SRC_KEY = 'paperSearch.sources.v1';
+const FIELD_ORDER = ['전 분야', '인문학', '사회과학', '교육학', '자연과학', '공학', '생명과학', '의학', '약학', '간호학', '치의학', '수의학', '일본 학술자료'];
+
+function renderSources(selectedIds) {
+  const sel = new Set(selectedIds || SOURCES.filter(s => s.on).map(s => s.id));
+  el.srcList.innerHTML = SOURCES.map(s => `
+    <label class="src">
+      <input type="checkbox" value="${s.id}" ${sel.has(s.id) ? 'checked' : ''}>
+      <span><span class="src-name">${esc(s.name)}</span>
+        <span class="src-note">${esc(s.note)}</span>
+        <span class="src-tags">${s.snu ? '<span class="snu">서울대 학술DB</span>' : ''}${s.fields.map(f => `<span>${esc(f)}</span>`).join('')}</span>
+      </span>
+    </label>`).join('');
+  el.fieldChips.innerHTML = FIELD_ORDER.map(f => `<button type="button" data-field="${esc(f)}">${esc(f)}</button>`).join('');
+}
+const selectedSources = () => [...el.srcList.querySelectorAll('input:checked')].map(i => i.value);
+function saveSources() { try { localStorage.setItem(SRC_KEY, JSON.stringify(selectedSources())); } catch { /* noop */ } }
+el.srcList.addEventListener('change', saveSources);
+el.fieldChips.addEventListener('click', e => {
+  const f = e.target.closest('button[data-field]')?.dataset.field;
+  if (!f) return;
+  el.srcList.querySelectorAll('input').forEach(i => { i.checked = SOURCES.find(s => s.id === i.value).fields.includes(f); });
+  saveSources();
+});
+
 /* ---------- 결과 병합 ---------- */
 function paperKey(p) { return p.doi ? 'doi:' + p.doi : 't:' + norm(p.title).slice(0, 120); }
 
@@ -235,38 +395,33 @@ async function runSearch() {
   let to = /^\d{4}$/.test(el.yearTo.value) ? +el.yearTo.value : '';
   if (from && to && from > to) { [from, to] = [to, from]; el.yearFrom.value = from; el.yearTo.value = to; }
   const o = { size: +el.size.value, from, to, oaOnly: el.oaOnly.checked };
-  const useEpmc = el.srcEpmc.checked, useOa = el.srcOa.checked;
-  if (!useEpmc && !useOa) { setStatus('검색 소스를 하나 이상 골라줘요.'); return; }
+  const srcIds = selectedSources();
+  if (!srcIds.length) { el.area.hidden = false; setStatus('검색 소스를 하나 이상 골라줘요.'); return; }
 
   const seq = ++searchSeq;
   state.searched = kws;
   state.papers.clear();
   state.titleIndex.clear();
   state.doiLookup = null;
+  resetPages();
   state.active = new Set(kws);
   updateScholarLink(kws);
   const yr = from || to ? `&y=${from}-${to}` : '';
-  try { history.replaceState(null, '', '#q=' + encodeURIComponent(kws.join(',')) + yr); } catch { /* noop */ }
+  try { history.replaceState(null, '', '#q=' + encodeURIComponent(kws.join(',')) + yr + '&s=' + srcIds.join(',')); } catch { /* noop */ }
   el.area.hidden = false;
   el.empty.hidden = true;
   el.results.innerHTML = '';
   el.searchBtn.disabled = true;
   setStatus('검색 중…');
 
-  const jobs = [];
-  for (const kw of kws) {
-    if (useEpmc) jobs.push(searchEpmc(kw, o).then(list => ({ kw, list }), err => ({ kw, err, src: 'Europe PMC' })));
-  }
-  // OpenAlex는 초당 요청 한도가 있어서 키워드별로 순서대로 보낸다
-  if (useOa) {
-    jobs.push((async () => {
-      const res = [];
-      for (const kw of kws) {
-        res.push(await searchOpenAlex(kw, o).then(list => ({ kw, list }), err => ({ kw, err, src: 'OpenAlex' })));
-      }
-      return res;
-    })());
-  }
+  // 소스끼리는 동시에, 한 소스 안에서는 요청 한도 때문에 키워드를 순서대로 보낸다
+  const jobs = SOURCES.filter(s => srcIds.includes(s.id)).map(async s => {
+    const res = [];
+    for (const kw of kws) {
+      res.push(await s.fn(kw, o).then(list => ({ kw, list }), err => ({ kw, err, src: s.name })));
+    }
+    return res;
+  });
   const out = (await Promise.all(jobs)).flat();
   if (seq !== searchSeq) return;
   const errors = [];
@@ -361,19 +516,61 @@ function render() {
       total += list.length;
       const h = document.createElement('h2');
       h.className = 'group-h';
+      h.id = 'grp-' + i;
       h.style.setProperty('--c', KW_COLORS[i]);
       h.innerHTML = `<span class="dot"></span>${esc(k)} <span class="meta">${list.length}편</span>`;
       frag.appendChild(h);
-      list.forEach(x => frag.appendChild(card(x.p, x.m)));
+      appendPage(frag, list, 'kw:' + k, h.id); // 키워드 묶음마다 따로 페이지를 넘긴다
     });
     setStatus(`논문 ${state.papers.size}편 중 키워드별로 나눠서 보는 중 (중복 포함 ${total}건)` + errHtml);
   } else {
     const list = filteredPapers();
-    list.forEach(x => frag.appendChild(card(x.p, x.m)));
-    setStatus(`${list.length}편 표시 (전체 ${state.papers.size}편)` + errHtml);
+    const pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+    setStatus(`${list.length}편 표시 (전체 ${state.papers.size}편${pages > 1 ? ` · ${pages}쪽` : ''})` + errHtml);
+    appendPage(frag, list, 'merged', 'resultsArea');
   }
   el.results.appendChild(frag);
 }
+
+/* ---------- 페이지 나누기 (한 쪽에 30편) ---------- */
+const PAGE_SIZE = 30;
+state.pages = {};
+function appendPage(frag, list, key, anchorId) {
+  const pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+  const page = Math.min(state.pages[key] || 0, pages - 1);
+  state.pages[key] = page;
+  if (pages > 1) frag.appendChild(pager(key, page, pages, list.length, anchorId));
+  list.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).forEach(x => frag.appendChild(card(x.p, x.m)));
+  if (pages > 1) frag.appendChild(pager(key, page, pages, list.length, anchorId));
+}
+function pager(key, page, pages, total, anchorId) {
+  const nav = document.createElement('nav');
+  nav.className = 'pager';
+  nav.setAttribute('aria-label', '페이지');
+  // 검색 사이트처럼 쪽 번호를 10개 단위로 보여 준다 (1~10, 11~20 …)
+  const start = Math.floor(page / 10) * 10;
+  const end = Math.min(pages, start + 10);
+  let html = page > 0 ? `<button type="button" class="pg-nav" data-pg="${page - 1}">이전</button>` : '';
+  for (let n = start; n < end; n++) {
+    html += `<button type="button" data-pg="${n}" class="${n === page ? 'on' : ''}" ${n === page ? 'aria-current="page"' : `aria-label="${n + 1}쪽"`}>${n + 1}</button>`;
+  }
+  if (page < pages - 1) html += `<button type="button" class="pg-nav" data-pg="${page + 1}">다음</button>`;
+  nav.title = `${page * PAGE_SIZE + 1}–${Math.min(total, (page + 1) * PAGE_SIZE)} / ${total}편`;
+  nav.innerHTML = html;
+  nav.dataset.key = key;
+  nav.dataset.anchor = anchorId;
+  return nav;
+}
+el.results.addEventListener('click', e => {
+  const b = e.target.closest('.pager button[data-pg]');
+  if (!b || b.disabled) return;
+  const nav = b.closest('.pager');
+  state.pages[nav.dataset.key] = +b.dataset.pg;
+  const anchor = nav.dataset.anchor;
+  render();
+  document.getElementById(anchor === 'resultsArea' ? 'results' : anchor)?.scrollIntoView({ block: 'start' });
+});
+function resetPages() { state.pages = {}; }
 
 function linksHtml(p) {
   const scholar = 'https://scholar.google.com/scholar?q=' + encodeURIComponent(`"${p.title}"`);
@@ -524,20 +721,23 @@ el.filterChips.addEventListener('click', e => {
     const k = b.dataset.k;
     state.active.has(k) ? state.active.delete(k) : state.active.add(k);
   }
+  resetPages();
   render();
 });
 document.querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () => {
   state.view = b.dataset.view;
   document.querySelectorAll('[data-view]').forEach(x => x.classList.toggle('on', x === b));
+  resetPages();
   render();
 }));
 document.querySelectorAll('[data-match]').forEach(b => b.addEventListener('click', () => {
   state.match = b.dataset.match;
   document.querySelectorAll('[data-match]').forEach(x => x.classList.toggle('on', x === b));
+  resetPages();
   render();
 }));
-el.titleOnly.addEventListener('change', render);
-el.sort.addEventListener('change', render);
+el.titleOnly.addEventListener('change', () => { resetPages(); render(); });
+el.sort.addEventListener('change', () => { resetPages(); render(); });
 el.form.addEventListener('submit', e => { e.preventDefault(); runSearch(); });
 
 /* ---------- 선택(PDF에 담기) ---------- */
@@ -750,6 +950,11 @@ renderTray();
   const m = location.hash.match(/q=([^&]+)/);
   const y = location.hash.match(/[#&]y=(\d{4})?-(\d{4})?/);
   if (y) { el.yearFrom.value = y[1] || ''; el.yearTo.value = y[2] || ''; }
+  // 검색 소스: 링크(s=) > 이전에 고른 것 > 기본값
+  const sm = location.hash.match(/[#&]s=([a-z,]+)/);
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(SRC_KEY) || 'null'); } catch { /* noop */ }
+  renderSources(sm ? sm[1].split(',') : saved);
   if (m) {
     try { addKeywords(decodeURIComponent(m[1])); } catch { /* noop */ }
     if (state.keywords.length) runSearch();

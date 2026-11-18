@@ -24,12 +24,13 @@
         <input id="kwInput" type="text" placeholder="예: quality control, defect detection, machine vision">
       </div>
 
+      <fieldset class="sources">
+        <legend>검색 소스 <span class="hint">(분야를 누르면 그 분야를 다루는 DB가 선택돼요)</span></legend>
+        <div id="fieldChips" class="field-chips" role="group" aria-label="분야로 고르기"></div>
+        <div id="srcList" class="src-list"></div>
+      </fieldset>
+
       <div class="opts">
-        <fieldset>
-          <legend>검색 소스</legend>
-          <label><input type="checkbox" id="srcEpmc" checked> Europe PMC</label>
-          <label><input type="checkbox" id="srcOa" checked> OpenAlex</label>
-        </fieldset>
         <span class="opt" role="group" aria-label="발행 연도 범위">발행 연도
           <input type="number" id="yearFrom" min="1900" max="2100" placeholder="시작" aria-label="시작 연도"> ~
           <input type="number" id="yearTo" min="1900" max="2100" placeholder="끝" aria-label="끝 연도">
@@ -100,7 +101,12 @@
 
 <footer class="foot wrap">
   데이터: <a href="https://europepmc.org" target="_blank" rel="noopener">Europe PMC</a> ·
-  <a href="https://openalex.org" target="_blank" rel="noopener">OpenAlex</a>
+  <a href="https://openalex.org" target="_blank" rel="noopener">OpenAlex</a> ·
+  <a href="https://pubmed.ncbi.nlm.nih.gov" target="_blank" rel="noopener">PubMed</a> ·
+  <a href="https://plos.org" target="_blank" rel="noopener">PLOS</a> ·
+  <a href="https://doaj.org" target="_blank" rel="noopener">DOAJ</a> ·
+  <a href="https://eric.ed.gov" target="_blank" rel="noopener">ERIC</a> ·
+  <a href="https://cir.nii.ac.jp" target="_blank" rel="noopener">CiNii</a>
 </footer>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
