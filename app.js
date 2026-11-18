@@ -423,7 +423,8 @@ function addPaper(raw, kw, rank) {
     p.isOA = p.isOA || raw.isOA;
     p.cited = Math.max(p.cited, raw.cited);
   }
-  for (const l of raw.links) if (!p.links.some(x => x.url === l.url)) p.links.push(l);
+  // 링크는 종류(DOI, OpenAlex 등)마다 처음 것 하나만 둔다 — 같은 제목의 다른 기록이 합쳐져도 링크가 늘어나지 않게
+  for (const l of raw.links) if (!p.links.some(x => x.url === l.url || x.label === l.label)) p.links.push(l);
   p.sources.add(raw.source);
   p.queryHits.add(kw);
   p.score += 1 / (rank + 5);
@@ -682,9 +683,12 @@ el.results.addEventListener('click', async e => {
 });
 function resetPages() { state.pages = {}; }
 
+// 같은 종류(label)의 링크는 하나만 남긴다 (예전에 저장된 선택 목록에도 적용)
+const uniqueLinks = links => (links || []).filter((l, i, a) => a.findIndex(x => x.label === l.label) === i);
+
 function linksHtml(p) {
   const scholar = 'https://scholar.google.com/scholar?q=' + encodeURIComponent(`"${p.title}"`);
-  return p.links.map(l => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('') +
+  return uniqueLinks(p.links).map(l => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('') +
     `<a href="${esc(scholar)}" target="_blank" rel="noopener">Google Scholar ↗</a>`;
 }
 
@@ -942,7 +946,7 @@ function buildPdfHtml(items) {
       <div class="a" style="font-size:14px;font-weight:700;line-height:1.4">${n + 1}. ${esc(s.title)}</div>
       <div class="a" style="color:#555;font-size:10.5px;margin-top:2px">${esc([s.authors, s.venue, s.year].filter(Boolean).join(' · '))}</div>
       <div class="a" style="margin-top:4px">${s.keywords.map(k => `<span style="display:inline-block;font-size:10px;color:#fff;background:${KW_HEX[k.i] || '#555'};border-radius:8px;padding:0 6px;margin-right:4px">${esc(k.k)} · ${esc(k.where)}</span>`).join('')}</div>
-      <div style="font-size:10px;margin-top:4px;word-break:break-all">${s.links.map(l => `<div class="a">${esc(l.label)}: <a href="${esc(l.url)}" style="color:#2456c9">${esc(l.url)}</a></div>`).join('')}</div>
+      <div style="font-size:10px;margin-top:4px;word-break:break-all">${uniqueLinks(s.links).map(l => `<div class="a">${esc(l.label)}: <a href="${esc(l.url)}" style="color:#2456c9">${esc(l.url)}</a></div>`).join('')}</div>
       ${pdfParts(s.summary)}
     </div>`).join('');
   const wrap = document.createElement('div');
