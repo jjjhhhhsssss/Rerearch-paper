@@ -517,11 +517,15 @@ el.clearSel.addEventListener('click', () => {
 });
 
 /* ---------- PDF 내보내기 ---------- */
+// 논문 전체를 긴 이미지 한 장으로 만들면 브라우저 캔버스 한계 때문에 잘린다.
+// 그래서 블록(머리말, 논문 1편)마다 따로 그리고, 문장(.a) 경계에서만 페이지를 넘긴다.
+const PDF = { margin: 12, bottom: 14, pageW: 210, pageH: 297 };
+
 function pdfSummary(title, s) {
   const items = s?.items?.length
-    ? `<ul style="margin:4px 0 0;padding-left:18px">${s.items.map(t => `<li style="margin-bottom:3px">${esc(t)}</li>`).join('')}</ul>`
-    : '<p style="margin:4px 0 0;color:#666">추출된 문장 없음 (원문 확인 필요)</p>';
-  return `<div style="margin-top:8px"><b>${title}</b> <span style="color:#777;font-size:10px">${esc(s?.basis || '')}</span>${items}</div>`;
+    ? `<ul style="margin:4px 0 0;padding-left:18px">${s.items.map(t => `<li class="a" style="margin-bottom:3px">${esc(t)}</li>`).join('')}</ul>`
+    : '<p class="a" style="margin:4px 0 0;color:#666">추출된 문장 없음 (원문 확인 필요)</p>';
+  return `<div style="margin-top:8px"><div class="a"><b>${title}</b> <span style="color:#777;font-size:10px">${esc(s?.basis || '')}</span></div>${items}</div>`;
 }
 
 function buildPdfHtml(items) {
@@ -536,22 +540,95 @@ function buildPdfHtml(items) {
     </div>`;
   const body = items.map((s, n) => `
     <div class="pdf-item" style="padding:10px 0 12px;border-bottom:1px solid #ddd">
-      <div style="font-size:14px;font-weight:700;line-height:1.4">${n + 1}. ${esc(s.title)}</div>
-      <div style="color:#555;font-size:10.5px;margin-top:2px">${esc([s.authors, s.venue, s.year].filter(Boolean).join(' · '))}</div>
-      <div style="margin-top:4px">${s.keywords.map(k => `<span style="display:inline-block;font-size:10px;color:#fff;background:${KW_HEX[k.i] || '#555'};border-radius:8px;padding:0 6px;margin-right:4px">${esc(k.k)} · ${esc(k.where)}</span>`).join('')}</div>
-      <div style="font-size:10px;margin-top:4px;word-break:break-all">${s.links.map(l => `${esc(l.label)}: <a href="${esc(l.url)}" style="color:#2456c9">${esc(l.url)}</a>`).join('<br>')}</div>
+      <div class="a" style="font-size:14px;font-weight:700;line-height:1.4">${n + 1}. ${esc(s.title)}</div>
+      <div class="a" style="color:#555;font-size:10.5px;margin-top:2px">${esc([s.authors, s.venue, s.year].filter(Boolean).join(' · '))}</div>
+      <div class="a" style="margin-top:4px">${s.keywords.map(k => `<span style="display:inline-block;font-size:10px;color:#fff;background:${KW_HEX[k.i] || '#555'};border-radius:8px;padding:0 6px;margin-right:4px">${esc(k.k)} · ${esc(k.where)}</span>`).join('')}</div>
+      <div style="font-size:10px;margin-top:4px;word-break:break-all">${s.links.map(l => `<div class="a">${esc(l.label)}: <a href="${esc(l.url)}" style="color:#2456c9">${esc(l.url)}</a></div>`).join('')}</div>
       ${pdfSummary('Results 요약', s.summary?.results)}
       ${pdfSummary('Discussion 요약', s.summary?.discussion)}
     </div>`).join('');
   const wrap = document.createElement('div');
-  wrap.style.cssText = 'width:180mm;color:#111;background:#fff;font-family:"Malgun Gothic","Apple SD Gothic Neo","Noto Sans KR",sans-serif;font-size:11.5px;line-height:1.55';
-  wrap.innerHTML = head + body;
+  wrap.style.cssText = `position:absolute;left:0;top:${window.scrollY}px;z-index:-1;width:${PDF.pageW - PDF.margin * 2}mm;color:#111;background:#fff;font-family:"Malgun Gothic","Apple SD Gothic Neo","Noto Sans KR",sans-serif;font-size:11.5px;line-height:1.55`;
+  wrap.innerHTML = head.replace('<div style=', '<div class="a" style=') + body;
   return wrap;
+}
+
+function sliceCanvas(canvas, fromPx, toPx) {
+  const c = document.createElement('canvas');
+  c.width = canvas.width;
+  c.height = Math.max(1, toPx - fromPx);
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.drawImage(canvas, 0, fromPx, canvas.width, c.height, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.92);
+}
+
+async function renderPdf(items, onProgress) {
+  const { jsPDF } = window.jspdf;
+  const pdf = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
+  const contentW = PDF.pageW - PDF.margin * 2;
+  const pageBottom = PDF.pageH - PDF.bottom;
+  const root = buildPdfHtml(items);
+  document.body.appendChild(root);
+  try {
+    let y = PDF.margin;
+    const blocks = [...root.children];
+    for (let bi = 0; bi < blocks.length; bi++) {
+      onProgress?.(bi + 1, blocks.length);
+      const blk = blocks[bi];
+      const box = blk.getBoundingClientRect();
+      const H = box.height;
+      const mmPerPx = contentW / box.width;
+      // 잘라도 되는 위치 = 각 문장·줄 블록의 아래쪽
+      const breaks = [...new Set([...blk.querySelectorAll('.a')].map(e => e.getBoundingClientRect().bottom - box.top).concat([H]))].sort((a, b) => a - b);
+      const links = [...blk.querySelectorAll('a[href]')].map(a => {
+        const r = a.getBoundingClientRect();
+        return { url: a.href, x: r.left - box.left, y: r.top - box.top, w: r.width, h: r.height };
+      });
+      const canvas = await html2canvas(blk, { scale: 2, backgroundColor: '#ffffff', logging: false, useCORS: true });
+      const k = canvas.height / H; // CSS px -> 캔버스 px
+
+      let start = 0;
+      while (start < H - 0.5) {
+        const availPx = (pageBottom - y) / mmPerPx;
+        let end;
+        if (H - start <= availPx) end = H;
+        else {
+          const fit = breaks.filter(b => b > start + 1 && b <= start + availPx);
+          if (fit.length) end = fit[fit.length - 1];
+          else if (y > PDF.margin + 0.5) { pdf.addPage(); y = PDF.margin; continue; } // 다음 페이지에서 다시 시도
+          else end = start + availPx; // 한 줄이 한 페이지보다 큰 경우만 강제로 자름
+        }
+        const hMm = (end - start) * mmPerPx;
+        pdf.addImage(sliceCanvas(canvas, Math.round(start * k), Math.round(end * k)), 'JPEG', PDF.margin, y, contentW, hMm);
+        for (const l of links) {
+          if (l.y >= start - 1 && l.y + l.h <= end + 1) {
+            pdf.link(PDF.margin + l.x * mmPerPx, y + (l.y - start) * mmPerPx, l.w * mmPerPx, l.h * mmPerPx, { url: l.url });
+          }
+        }
+        y += hMm;
+        start = end;
+        if (start < H - 0.5) { pdf.addPage(); y = PDF.margin; }
+      }
+      y += 2;
+    }
+    const n = pdf.getNumberOfPages();
+    for (let i = 1; i <= n; i++) {
+      pdf.setPage(i);
+      pdf.setFontSize(9);
+      pdf.setTextColor(150);
+      pdf.text(`${i} / ${n}`, PDF.pageW / 2, PDF.pageH - 6, { align: 'center' });
+    }
+    return pdf;
+  } finally {
+    root.remove();
+  }
 }
 
 el.exportPdf.addEventListener('click', async () => {
   if (!state.selected.size) return;
-  if (typeof html2pdf === 'undefined') { alert('PDF 라이브러리를 불러오지 못했어요. 인터넷 연결을 확인해 줘요.'); return; }
+  if (typeof html2canvas === 'undefined' || !window.jspdf) { alert('PDF 라이브러리를 불러오지 못했어요. 인터넷 연결을 확인해 줘요.'); return; }
   el.exportPdf.disabled = true;
   const label = el.exportPdf.textContent;
   el.exportPdf.textContent = '요약 정리 중…';
@@ -562,16 +639,10 @@ el.exportPdf.addEventListener('click', async () => {
       if (p && !snap.summary) { await ensureSummary(p); state.selected.set(key, snapshot(p)); }
     }
     saveSelected();
-    el.exportPdf.textContent = 'PDF 만드는 중…';
-    const node = buildPdfHtml([...state.selected.values()]);
-    await html2pdf().set({
-      margin: [12, 12, 14, 12],
-      filename: `선행연구_요약_${Date.now()}.pdf`,
-      image: { type: 'jpeg', quality: 0.95 },
-      html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff' },
-      jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
-      pagebreak: { mode: ['css', 'legacy'], avoid: '.pdf-item' },
-    }).from(node).save();
+    const pdf = await renderPdf([...state.selected.values()], (i, n) => {
+      el.exportPdf.textContent = `PDF 만드는 중… (${i}/${n})`;
+    });
+    pdf.save(`선행연구_요약_${Date.now()}.pdf`);
   } catch (err) {
     alert('PDF 생성 중 오류: ' + err.message);
   } finally {
