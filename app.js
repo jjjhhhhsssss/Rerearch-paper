@@ -8,7 +8,7 @@ const SEL_KEY = 'paperSearch.selected.v1';
 const $ = id => document.getElementById(id);
 const el = {
   form: $('searchForm'), kwBox: $('kwBox'), kwChips: $('kwChips'), kwInput: $('kwInput'),
-  srcEpmc: $('srcEpmc'), srcOa: $('srcOa'), yearFrom: $('yearFrom'), size: $('size'), oaOnly: $('oaOnly'),
+  srcEpmc: $('srcEpmc'), srcOa: $('srcOa'), yearFrom: $('yearFrom'), yearTo: $('yearTo'), size: $('size'), oaOnly: $('oaOnly'),
   searchBtn: $('searchBtn'), scholarLink: $('scholarLink'),
   area: $('resultsArea'), empty: $('emptyState'), filterChips: $('filterChips'), matchSeg: $('matchSeg'),
   titleOnly: $('titleOnly'), sort: $('sort'), status: $('status'), results: $('results'),
@@ -51,10 +51,17 @@ function saveSelected() {
   try { localStorage.setItem(SEL_KEY, JSON.stringify([...state.selected])); } catch { /* 저장 불가 환경 */ }
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// 응답이 없는 요청이 대기열을 막지 않도록 20초 뒤 끊는다
+const fetchT = (url, ms = 20000) => fetch(url, AbortSignal.timeout ? { signal: AbortSignal.timeout(ms) } : undefined);
+// 429(요청 과다)·5xx는 잠시 기다렸다가 최대 2번 다시 시도
 async function fetchJson(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
+  for (let attempt = 0; ; attempt++) {
+    const r = await fetchT(url);
+    if (r.ok) return r.json();
+    if ((r.status === 429 || r.status >= 500) && attempt < 2) { await sleep(1500 * (attempt + 1)); continue; }
+    throw new Error(r.status === 429 ? '요청 한도 초과, 잠시 후 다시 검색' : `HTTP ${r.status}`);
+  }
 }
 
 /* ---------- 키워드 입력 ---------- */
@@ -105,7 +112,7 @@ function updateScholarLink(kws) {
 async function searchEpmc(kw, o) {
   let q = `"${kw}"`;
   if (o.oaOnly) q += ' AND OPEN_ACCESS:y';
-  if (o.from) q += ` AND PUB_YEAR:[${o.from} TO 3000]`;
+  if (o.from || o.to) q += ` AND PUB_YEAR:[${o.from || 1800} TO ${o.to || 3000}]`;
   const url = `https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=${encodeURIComponent(q)}&format=json&resultType=core&pageSize=${o.size}`;
   const data = await fetchJson(url);
   return (data.resultList?.result || []).map(r => {
@@ -120,7 +127,7 @@ async function searchEpmc(kw, o) {
       venue: r.journalInfo?.journal?.title || r.bookOrReportDetails?.publisher || '',
       doi: (r.doi || '').toLowerCase(),
       pmcid: r.pmcid || '',
-      fulltextAvail: r.isOpenAccess === 'Y' && r.inEPMC === 'Y' && !!r.pmcid,
+      fulltextAvail: r.inEPMC === 'Y' && !!r.pmcid,
       isOA: r.isOpenAccess === 'Y',
       cited: r.citedByCount || 0,
       abstractRaw: r.abstractText || '',
@@ -140,6 +147,7 @@ function invertedToText(inv) {
 async function searchOpenAlex(kw, o) {
   const filters = ['has_abstract:true'];
   if (o.from) filters.push(`from_publication_date:${o.from}-01-01`);
+  if (o.to) filters.push(`to_publication_date:${o.to}-12-31`);
   if (o.oaOnly) filters.push('is_oa:true');
   const params = new URLSearchParams({
     search: `"${kw}"`,
@@ -223,11 +231,10 @@ async function runSearch() {
   if (el.kwInput.value.trim()) { addKeywords(el.kwInput.value); el.kwInput.value = ''; }
   const kws = [...state.keywords];
   if (!kws.length) { el.kwInput.focus(); return; }
-  const o = {
-    size: +el.size.value,
-    from: /^\d{4}$/.test(el.yearFrom.value) ? el.yearFrom.value : '',
-    oaOnly: el.oaOnly.checked,
-  };
+  let from = /^\d{4}$/.test(el.yearFrom.value) ? +el.yearFrom.value : '';
+  let to = /^\d{4}$/.test(el.yearTo.value) ? +el.yearTo.value : '';
+  if (from && to && from > to) { [from, to] = [to, from]; el.yearFrom.value = from; el.yearTo.value = to; }
+  const o = { size: +el.size.value, from, to, oaOnly: el.oaOnly.checked };
   const useEpmc = el.srcEpmc.checked, useOa = el.srcOa.checked;
   if (!useEpmc && !useOa) { setStatus('검색 소스를 하나 이상 골라줘요.'); return; }
 
@@ -235,9 +242,11 @@ async function runSearch() {
   state.searched = kws;
   state.papers.clear();
   state.titleIndex.clear();
+  state.doiLookup = null;
   state.active = new Set(kws);
   updateScholarLink(kws);
-  try { history.replaceState(null, '', '#q=' + encodeURIComponent(kws.join(','))); } catch { /* noop */ }
+  const yr = from || to ? `&y=${from}-${to}` : '';
+  try { history.replaceState(null, '', '#q=' + encodeURIComponent(kws.join(',')) + yr); } catch { /* noop */ }
   el.area.hidden = false;
   el.empty.hidden = true;
   el.results.innerHTML = '';
@@ -247,9 +256,18 @@ async function runSearch() {
   const jobs = [];
   for (const kw of kws) {
     if (useEpmc) jobs.push(searchEpmc(kw, o).then(list => ({ kw, list }), err => ({ kw, err, src: 'Europe PMC' })));
-    if (useOa) jobs.push(searchOpenAlex(kw, o).then(list => ({ kw, list }), err => ({ kw, err, src: 'OpenAlex' })));
   }
-  const out = await Promise.all(jobs);
+  // OpenAlex는 초당 요청 한도가 있어서 키워드별로 순서대로 보낸다
+  if (useOa) {
+    jobs.push((async () => {
+      const res = [];
+      for (const kw of kws) {
+        res.push(await searchOpenAlex(kw, o).then(list => ({ kw, list }), err => ({ kw, err, src: 'OpenAlex' })));
+      }
+      return res;
+    })());
+  }
+  const out = (await Promise.all(jobs)).flat();
   if (seq !== searchSeq) return;
   const errors = [];
   for (const r of out) {
@@ -258,7 +276,29 @@ async function runSearch() {
   }
   el.searchBtn.disabled = false;
   state.lastErrors = errors;
+  state.doiLookup = lookupPmcByDoi([...state.papers.values()]);
   render();
+}
+
+// PMC 번호가 없는 논문(주로 OpenAlex)을 DOI로 Europe PMC에서 25개씩 묶어 조회 → 본문을 쓸 수 있으면 표시
+async function lookupPmcByDoi(papers) {
+  const need = papers.filter(p => !p.pmcid && p.doi && /^10\.\S+$/.test(p.doi));
+  for (let i = 0; i < need.length; i += 25) {
+    const chunk = need.slice(i, i + 25);
+    const q = chunk.map(p => `DOI:"${p.doi.replace(/"/g, '')}"`).join(' OR ');
+    try {
+      const d = await fetchJson(`https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=${encodeURIComponent(q)}&format=json&resultType=lite&pageSize=100`);
+      for (const hit of d.resultList?.result || []) {
+        if (!hit.pmcid || !hit.doi) continue;
+        const p = chunk.find(x => x.doi === hit.doi.toLowerCase());
+        if (!p || p.pmcid) continue;
+        p.pmcid = hit.pmcid;
+        p.fulltextAvail = hit.inEPMC === 'Y';
+        const url = `https://www.ncbi.nlm.nih.gov/pmc/articles/${hit.pmcid}/`;
+        if (!p.links.some(l => l.url === url)) p.links.push({ label: 'PMC 전문', url });
+      }
+    } catch { /* 조회 실패 시 초록만 사용 */ }
+  }
 }
 
 function setStatus(html) { el.status.innerHTML = html; }
@@ -335,12 +375,17 @@ function render() {
   el.results.appendChild(frag);
 }
 
+function linksHtml(p) {
+  const scholar = 'https://scholar.google.com/scholar?q=' + encodeURIComponent(`"${p.title}"`);
+  return p.links.map(l => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('') +
+    `<a href="${esc(scholar)}" target="_blank" rel="noopener">Google Scholar ↗</a>`;
+}
+
 function card(p, m) {
   const div = document.createElement('article');
   div.className = 'card' + (state.selected.has(p.key) ? ' sel' : '');
   div.dataset.key = p.key;
   const kws = state.searched;
-  const scholar = 'https://scholar.google.com/scholar?q=' + encodeURIComponent(`"${p.title}"`);
   div.innerHTML = `
     <div class="card-head">
       <div>
@@ -353,32 +398,49 @@ function card(p, m) {
       ${m.map(x => `<span class="tag" style="--c:${KW_COLORS[x.i]}" title="${esc(x.where)}에 포함">${esc(x.k)} <small>· ${esc(x.where)}</small></span>`).join('')}
       ${[...p.sources].map(s => `<span class="tag src">${esc(s)}</span>`).join('')}
       ${p.isOA ? '<span class="tag oa">오픈액세스</span>' : ''}
+      ${p.summary?.ft === 'ok' ? '<span class="tag ft">본문 요약</span>' : ''}
     </div>
-    <div class="links">
-      ${p.links.map(l => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}
-      <a href="${esc(scholar)}" target="_blank" rel="noopener">Google Scholar ↗</a>
-    </div>
+    <div class="links">${linksHtml(p)}</div>
     <div class="sum-wrap">${summaryHtml(p)}</div>`;
   if (!p.summary) observer.observe(div);
   return div;
 }
 
-function summaryBlock(title, s, kws) {
-  const basis = s?.basis ? `<span class="basis">${esc(s.basis)}</span>` : '';
-  const body = s?.items?.length
+// 요약 구조: { results: { ft, abs }, discussion: { ft, abs }, ft: 'ok'|'nosection'|'none' }
+// ft = 본문 기반 추출, abs = 초록 기반 추출. 예전 형식(저장된 선택 목록)도 읽을 수 있게 변환한다.
+function normSection(s) {
+  if (!s) return { ft: null, abs: null };
+  if ('items' in s) return /^본문/.test(s.basis || '') ? { ft: s, abs: null } : { ft: null, abs: s };
+  return s;
+}
+function normSummary(sum) {
+  if (!sum) return null;
+  return { results: normSection(sum.results), discussion: normSection(sum.discussion), ft: sum.ft || 'none' };
+}
+
+const FT_NOTE = { none: '본문 미공개 · 초록만 사용', nosection: '본문에 해당 섹션 없음', loading: '본문 불러오는 중…' };
+
+function subList(label, s, kws) {
+  if (!s) return '';
+  const body = s.items?.length
     ? `<ul>${s.items.map(t => `<li>${highlight(t, kws)}</li>`).join('')}</ul>`
-    : '<p class="none">추출할 문장을 찾지 못했어요. 원문 링크에서 확인해 줘요.</p>';
-  return `<section><h4>${title}${basis}</h4>${body}</section>`;
+    : '<p class="none">추출할 문장을 찾지 못했어요.</p>';
+  return `<div class="sub"><div class="sub-h">${label}<span class="basis">${esc(s.basis || '')}</span></div>${body}</div>`;
+}
+function summaryBlock(title, sec, ftState, kws) {
+  const note = !sec.ft ? `<p class="ft-note">${esc(FT_NOTE[ftState] || FT_NOTE.none)}</p>` : '';
+  return `<section><h4>${title}</h4>${subList('본문 기반', sec.ft, kws)}${note}${subList('초록 기반', sec.abs, kws)}</section>`;
 }
 function summaryHtml(p) {
   if (!p.summary) return '<p class="loading">요약 불러오는 중…</p>';
-  return `<div class="sum">${summaryBlock('Results 요약', p.summary.results, state.searched)}${summaryBlock('Discussion 요약', p.summary.discussion, state.searched)}</div>`;
+  const s = normSummary(p.summary);
+  return `<div class="sum">${summaryBlock('Results 요약', s.results, s.ft, state.searched)}${summaryBlock('Discussion 요약', s.discussion, s.ft, state.searched)}</div>`;
 }
 
 /* ---------- 요약 (화면에 보일 때 불러옴) ---------- */
 const ftQueue = [];
 let ftRunning = 0;
-const FT_CONCURRENCY = 4;
+const FT_CONCURRENCY = 6;
 function queueFetch(fn) {
   return new Promise((resolve, reject) => {
     ftQueue.push({ fn, resolve, reject });
@@ -394,25 +456,38 @@ function pump() {
 }
 
 function ensureSummary(p) {
-  if (p.summary) return Promise.resolve(p.summary);
   if (p.summaryPromise) return p.summaryPromise;
+  if (p.summary) return Promise.resolve(p.summary);
   const kws = state.searched;
   p.summaryPromise = (async () => {
     const abs = Summ.fromAbstract(p.abstractRaw, kws);
+    // DOI로 PMC 본문을 찾는 일괄 조회가 끝날 때까지 기다린다
+    if (state.doiLookup) await state.doiLookup;
     let ft = null;
+    let ftState = 'none';
     if (p.fulltextAvail && p.pmcid) {
+      // 본문을 기다리는 동안 초록 요약부터 보여 준다
+      p.summary = {
+        results: { ft: null, abs: abs.results },
+        discussion: { ft: null, abs: abs.discussion },
+        ft: 'loading',
+      };
+      refreshCards(p.key);
       try {
         ft = await queueFetch(async () => {
-          const r = await fetch(`https://www.ebi.ac.uk/europepmc/webservices/rest/${p.pmcid}/fullTextXML`);
+          // Europe PMC 본문 서버는 한 건에 10~20초 걸릴 때가 있어 넉넉히 기다린다
+          const r = await fetchT(`https://www.ebi.ac.uk/europepmc/webservices/rest/${p.pmcid}/fullTextXML`, 40000);
           if (!r.ok) return null;
-          return Summ.fromFullText(await r.text(), kws);
+          const xml = await r.text();
+          return Summ.fromFullText(xml, kws) || { results: null, discussion: null, nosection: true };
         });
       } catch { ft = null; }
+      if (ft) ftState = ft.nosection ? 'nosection' : 'ok';
     }
-    const pickBetter = (a, b) => (a && a.items && a.items.length ? a : b);
     p.summary = {
-      results: pickBetter(ft?.results, abs.results),
-      discussion: pickBetter(ft?.discussion, abs.discussion),
+      results: { ft: ft?.results || null, abs: abs.results },
+      discussion: { ft: ft?.discussion || null, abs: abs.discussion },
+      ft: ftState,
     };
     return p.summary;
   })();
@@ -431,7 +506,11 @@ const observer = new IntersectionObserver(entries => {
 
 function refreshCards(key) {
   const p = state.papers.get(key);
-  document.querySelectorAll(`.card[data-key="${CSS.escape(key)}"] .sum-wrap`).forEach(w => { w.innerHTML = summaryHtml(p); });
+  document.querySelectorAll(`.card[data-key="${CSS.escape(key)}"]`).forEach(c => {
+    c.querySelector('.sum-wrap').innerHTML = summaryHtml(p);
+    c.querySelector('.links').innerHTML = linksHtml(p);
+    if (p.summary?.ft === 'ok' && !c.querySelector('.tag.ft')) c.querySelector('.tags').insertAdjacentHTML('beforeend', '<span class="tag ft">본문 요약</span>');
+  });
   if (state.selected.has(key)) { state.selected.set(key, snapshot(p)); saveSelected(); }
 }
 
@@ -521,11 +600,21 @@ el.clearSel.addEventListener('click', () => {
 // 그래서 블록(머리말, 논문 1편)마다 따로 그리고, 문장(.a) 경계에서만 페이지를 넘긴다.
 const PDF = { margin: 12, bottom: 14, pageW: 210, pageH: 297 };
 
-function pdfSummary(title, s) {
-  const items = s?.items?.length
-    ? `<ul style="margin:4px 0 0;padding-left:18px">${s.items.map(t => `<li class="a" style="margin-bottom:3px">${esc(t)}</li>`).join('')}</ul>`
-    : '<p class="a" style="margin:4px 0 0;color:#666">추출된 문장 없음 (원문 확인 필요)</p>';
-  return `<div style="margin-top:8px"><div class="a"><b>${title}</b> <span style="color:#777;font-size:10px">${esc(s?.basis || '')}</span></div>${items}</div>`;
+function pdfSubList(label, s) {
+  if (!s) return '';
+  const items = s.items?.length
+    ? `<ul style="margin:2px 0 0;padding-left:18px">${s.items.map(t => `<li class="a" style="margin-bottom:3px">${esc(t)}</li>`).join('')}</ul>`
+    : '<p class="a" style="margin:2px 0 0;color:#666">추출된 문장 없음 (원문 확인 필요)</p>';
+  return `<div style="margin-top:3px"><div class="a" style="font-size:10.5px;color:#2456c9;font-weight:600">${label} <span style="color:#777;font-weight:400">${esc(s.basis || '')}</span></div>${items}</div>`;
+}
+function pdfSummary(title, sec, ftState) {
+  const note = !sec.ft ? `<div class="a" style="font-size:10px;color:#777;margin-top:2px">${esc(FT_NOTE[ftState] || FT_NOTE.none)}</div>` : '';
+  return `<div style="margin-top:8px"><div class="a"><b>${title}</b></div>${pdfSubList('본문 기반', sec.ft)}${note}${pdfSubList('초록 기반', sec.abs)}</div>`;
+}
+
+function pdfParts(sum) {
+  const s = normSummary(sum) || { results: { ft: null, abs: null }, discussion: { ft: null, abs: null }, ft: 'none' };
+  return pdfSummary('Results 요약', s.results, s.ft) + pdfSummary('Discussion 요약', s.discussion, s.ft);
 }
 
 function buildPdfHtml(items) {
@@ -544,8 +633,7 @@ function buildPdfHtml(items) {
       <div class="a" style="color:#555;font-size:10.5px;margin-top:2px">${esc([s.authors, s.venue, s.year].filter(Boolean).join(' · '))}</div>
       <div class="a" style="margin-top:4px">${s.keywords.map(k => `<span style="display:inline-block;font-size:10px;color:#fff;background:${KW_HEX[k.i] || '#555'};border-radius:8px;padding:0 6px;margin-right:4px">${esc(k.k)} · ${esc(k.where)}</span>`).join('')}</div>
       <div style="font-size:10px;margin-top:4px;word-break:break-all">${s.links.map(l => `<div class="a">${esc(l.label)}: <a href="${esc(l.url)}" style="color:#2456c9">${esc(l.url)}</a></div>`).join('')}</div>
-      ${pdfSummary('Results 요약', s.summary?.results)}
-      ${pdfSummary('Discussion 요약', s.summary?.discussion)}
+      ${pdfParts(s.summary)}
     </div>`).join('');
   const wrap = document.createElement('div');
   wrap.style.cssText = `position:absolute;left:0;top:${window.scrollY}px;z-index:-1;width:${PDF.pageW - PDF.margin * 2}mm;color:#111;background:#fff;font-family:"Malgun Gothic","Apple SD Gothic Neo","Noto Sans KR",sans-serif;font-size:11.5px;line-height:1.55`;
@@ -564,7 +652,8 @@ function sliceCanvas(canvas, fromPx, toPx) {
   return c.toDataURL('image/jpeg', 0.92);
 }
 
-async function renderPdf(items, onProgress) {
+// stats(선택): 점검용. 블록별 원래 높이와 PDF에 실제로 들어간 높이, 페이지 밖으로 넘친 횟수를 기록한다.
+async function renderPdf(items, onProgress, stats) {
   const { jsPDF } = window.jspdf;
   const pdf = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
   const contentW = PDF.pageW - PDF.margin * 2;
@@ -588,6 +677,8 @@ async function renderPdf(items, onProgress) {
       });
       const canvas = await html2canvas(blk, { scale: 2, backgroundColor: '#ffffff', logging: false, useCORS: true });
       const k = canvas.height / H; // CSS px -> 캔버스 px
+      const rec = { H, placed: 0, blankCanvas: !canvas.width || !canvas.height };
+      stats?.blocks.push(rec);
 
       let start = 0;
       while (start < H - 0.5) {
@@ -601,6 +692,8 @@ async function renderPdf(items, onProgress) {
           else end = start + availPx; // 한 줄이 한 페이지보다 큰 경우만 강제로 자름
         }
         const hMm = (end - start) * mmPerPx;
+        rec.placed += end - start;
+        if (stats && y + hMm > pageBottom + 0.5) stats.overflow++;
         pdf.addImage(sliceCanvas(canvas, Math.round(start * k), Math.round(end * k)), 'JPEG', PDF.margin, y, contentW, hMm);
         for (const l of links) {
           if (l.y >= start - 1 && l.y + l.h <= end + 1) {
@@ -636,7 +729,7 @@ el.exportPdf.addEventListener('click', async () => {
     // 아직 요약이 없는 항목은 먼저 만든다
     for (const [key, snap] of state.selected) {
       const p = state.papers.get(key);
-      if (p && !snap.summary) { await ensureSummary(p); state.selected.set(key, snapshot(p)); }
+      if (p && (!snap.summary || snap.summary.ft === 'loading')) { await ensureSummary(p); state.selected.set(key, snapshot(p)); }
     }
     saveSelected();
     const pdf = await renderPdf([...state.selected.values()], (i, n) => {
@@ -655,6 +748,8 @@ el.exportPdf.addEventListener('click', async () => {
 renderTray();
 (() => {
   const m = location.hash.match(/q=([^&]+)/);
+  const y = location.hash.match(/[#&]y=(\d{4})?-(\d{4})?/);
+  if (y) { el.yearFrom.value = y[1] || ''; el.yearTo.value = y[2] || ''; }
   if (m) {
     try { addKeywords(decodeURIComponent(m[1])); } catch { /* noop */ }
     if (state.keywords.length) runSearch();

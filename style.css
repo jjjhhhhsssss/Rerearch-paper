@@ -120,6 +120,10 @@ input[type=number], select {
 .sum ul { margin: 0; padding-left: 18px; font-size: .88rem; }
 .sum li + li { margin-top: 4px; }
 .sum .none, .loading { color: var(--muted); font-size: .85rem; margin: 0; }
+.sub + .sub, .ft-note + .sub { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.sub-h { font-size: .8rem; font-weight: 600; color: var(--accent); display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 2px; }
+.ft-note { margin: 0; font-size: .78rem; color: var(--muted); }
+.tag.ft { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
 mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1px; }
 
 .empty { color: var(--muted); padding: 24px 4px; }

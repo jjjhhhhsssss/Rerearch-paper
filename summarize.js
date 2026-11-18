@@ -43,6 +43,8 @@ const Summ = (() => {
       if (opts.preferEnd) sc += (i / sents.length) * 1.5;
       if (opts.preferStart) sc += (1 - i / sents.length) * 1.5;
       if (/^(table|figure|fig\.)\s*\d/i.test(s)) sc -= 5;
+      // "Figure 1에 나와 있다" 같은 안내 문장은 내용이 없으므로 낮춘다
+      if (/\b(shown|presented|summari[sz]ed|listed|depicted|illustrated|displayed|provided|reported|given)\s+(in|by)\s+(the\s+)?(supplementary\s+)?(fig(ure)?s?\.?|tables?)\b/i.test(s)) sc -= 4;
       return { s, i, sc };
     });
     return scored
@@ -102,7 +104,7 @@ const Summ = (() => {
     if (doc.getElementsByTagName('parsererror').length) return {};
     const body = doc.getElementsByTagName('body')[0];
     if (!body) return {};
-    body.querySelectorAll('table-wrap, fig, disp-formula, supplementary-material, xref, ext-link[ext-link-type="uri"]').forEach(n => n.remove());
+    body.querySelectorAll('table-wrap, fig, disp-formula, supplementary-material, xref[ref-type="bibr"], ext-link[ext-link-type="uri"]').forEach(n => n.remove());
     const out = { results: '', discussion: '' };
     const secs = Array.from(body.children).filter(n => n.nodeName === 'sec');
     for (const sec of secs) {
