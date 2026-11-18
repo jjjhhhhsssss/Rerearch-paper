@@ -27,7 +27,10 @@
       <fieldset class="sources">
         <legend>검색 소스 <span class="hint">(분야를 누르면 그 분야를 다루는 DB가 선택돼요)</span></legend>
         <div id="fieldChips" class="field-chips" role="group" aria-label="분야로 고르기"></div>
-        <div id="srcList" class="src-list"></div>
+        <details class="src-toggle">
+          <summary><span id="srcSummary">검색할 DB</span></summary>
+          <div id="srcList" class="src-list"></div>
+        </details>
       </fieldset>
 
       <div class="opts">

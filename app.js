@@ -8,7 +8,7 @@ const SEL_KEY = 'paperSearch.selected.v1';
 const $ = id => document.getElementById(id);
 const el = {
   form: $('searchForm'), kwBox: $('kwBox'), kwChips: $('kwChips'), kwInput: $('kwInput'),
-  fieldChips: $('fieldChips'), srcList: $('srcList'), yearFrom: $('yearFrom'), yearTo: $('yearTo'), size: $('size'), oaOnly: $('oaOnly'),
+  fieldChips: $('fieldChips'), srcList: $('srcList'), srcSummary: $('srcSummary'), yearFrom: $('yearFrom'), yearTo: $('yearTo'), size: $('size'), oaOnly: $('oaOnly'),
   searchBtn: $('searchBtn'), scholarLink: $('scholarLink'),
   area: $('resultsArea'), empty: $('emptyState'), filterChips: $('filterChips'), matchSeg: $('matchSeg'),
   titleOnly: $('titleOnly'), sort: $('sort'), status: $('status'), results: $('results'),
@@ -339,21 +339,28 @@ async function searchCinii(kw, o, cur) {
   }), total, nextOffset(offset, items.length, total));
 }
 
-// 검색 소스 목록. fields = 그 DB에서 주로 찾을 수 있는 분야(서울대 학술DB 주제 분류와 DB 설명 기준)
-const SOURCES = [
-  { id: 'epmc', name: 'Europe PMC', fn: searchEpmc, on: true, fields: ['생명과학', '의학', '약학', '간호학'], note: '생의학 논문, 오픈액세스 본문 제공' },
-  { id: 'openalex', name: 'OpenAlex', fn: searchOpenAlex, on: true, fields: ['전 분야', '공학', '자연과학', '사회과학', '인문학'], note: '전 분야 학술 문헌 색인' },
-  { id: 'pubmed', name: 'PubMed', fn: searchPubMed, snu: true, fields: ['의학', '간호학', '치의학', '수의학', '생명과학'], note: '의학 분야 대표 서지 DB' },
-  { id: 'plos', name: 'PLOS', fn: searchPlos, snu: true, fields: ['생명과학', '의학', '자연과학'], note: '오픈액세스 과학 저널 (PLOS ONE 등)' },
-  { id: 'doaj', name: 'DOAJ', fn: searchDoaj, snu: true, fields: ['전 분야', '인문학', '사회과학', '자연과학', '공학', '의학'], note: '전 분야 오픈액세스 저널' },
-  { id: 'eric', name: 'ERIC', fn: searchEric, snu: true, fields: ['교육학'], note: '교육학 저널·보고서 (미국 교육부)' },
-  { id: 'cinii', name: 'CiNii', fn: searchCinii, snu: true, fields: ['전 분야', '인문학', '사회과학', '자연과학', '공학', '일본 학술자료'], note: '일본 학술 논문·학위논문 (일본어 검색 가능)' },
-];
-const SRC_KEY = 'paperSearch.sources.v1';
-const FIELD_ORDER = ['전 분야', '인문학', '사회과학', '교육학', '자연과학', '공학', '생명과학', '의학', '약학', '간호학', '치의학', '수의학', '일본 학술자료'];
+// 분야 목록: 서울대 학술DB 주제 분류 16개('일반'은 '전 분야'로) + 일본 학술자료
+const ALL_FIELDS = ['인문학', '사회과학', '경영학', '법학', '교육학', '예술', '자연과학', '공학', '생명과학', '농생명과학', '의학', '약학', '간호학', '치의학', '수의학'];
+const FIELD_ORDER = ['전 분야', ...ALL_FIELDS, '일본 학술자료'];
 
-function renderSources(selectedIds) {
-  const sel = new Set(selectedIds || SOURCES.filter(s => s.on).map(s => s.id));
+// 검색 소스 목록. fields = 그 DB에서 찾을 수 있는 분야 (DB 수록 범위 기준)
+const SOURCES = [
+  { id: 'epmc', name: 'Europe PMC', fn: searchEpmc, note: '생의학 논문, 오픈액세스 본문 제공 (AGRICOLA 농학 문헌 포함)',
+    fields: ['생명과학', '의학', '약학', '간호학', '치의학', '수의학', '농생명과학'] },
+  { id: 'openalex', name: 'OpenAlex', fn: searchOpenAlex, note: '전 분야 학술 문헌 색인', fields: ['전 분야', ...ALL_FIELDS] },
+  { id: 'pubmed', name: 'PubMed', fn: searchPubMed, note: '의학 분야 대표 서지 DB', fields: ['의학', '약학', '간호학', '치의학', '수의학', '생명과학'] },
+  { id: 'plos', name: 'PLOS', fn: searchPlos, note: '오픈액세스 과학 저널 (PLOS ONE 등)', fields: ['생명과학', '의학', '자연과학', '공학', '사회과학', '농생명과학'] },
+  { id: 'doaj', name: 'DOAJ', fn: searchDoaj, note: '전 분야 오픈액세스 저널', fields: ['전 분야', ...ALL_FIELDS] },
+  { id: 'eric', name: 'ERIC', fn: searchEric, note: '교육학 저널·보고서 (미국 교육부)', fields: ['교육학', '사회과학'] },
+  { id: 'cinii', name: 'CiNii', fn: searchCinii, note: '일본 학술 논문·학위논문 (일본어 검색 가능)',
+    fields: ['전 분야', ...ALL_FIELDS.filter(f => f !== '간호학'), '일본 학술자료'] },
+];
+
+// 분야 버튼을 누르면 그 분야를 다루는 DB만 체크한다. '전 분야'는 모든 DB.
+const sourcesForField = f => SOURCES.filter(s => f === '전 분야' || s.fields.includes(f)).map(s => s.id);
+
+function renderSources(selectedIds, field) {
+  const sel = new Set(selectedIds || sourcesForField('전 분야'));
   el.srcList.innerHTML = SOURCES.map(s => `
     <label class="src">
       <input type="checkbox" value="${s.id}" ${sel.has(s.id) ? 'checked' : ''}>
@@ -362,16 +369,36 @@ function renderSources(selectedIds) {
         <span class="src-tags">${s.fields.map(f => `<span>${esc(f)}</span>`).join('')}</span>
       </span>
     </label>`).join('');
-  el.fieldChips.innerHTML = FIELD_ORDER.map(f => `<button type="button" data-field="${esc(f)}">${esc(f)}</button>`).join('');
+  el.fieldChips.innerHTML = FIELD_ORDER.map(f => `<button type="button" data-field="${esc(f)}" aria-pressed="false">${esc(f)}</button>`).join('');
+  markField(selectedIds ? fieldOf([...sel]) : '전 분야');
+  updateSrcSummary();
 }
 const selectedSources = () => [...el.srcList.querySelectorAll('input:checked')].map(i => i.value);
-function saveSources() { try { localStorage.setItem(SRC_KEY, JSON.stringify(selectedSources())); } catch { /* noop */ } }
-el.srcList.addEventListener('change', saveSources);
+// 지금 체크된 DB 조합이 어떤 분야 버튼과 정확히 같은지 (없으면 null)
+function fieldOf(ids) {
+  const key = [...ids].sort().join(',');
+  return FIELD_ORDER.find(f => sourcesForField(f).sort().join(',') === key) || null;
+}
+function markField(f) {
+  el.fieldChips.querySelectorAll('button').forEach(b => {
+    const on = b.dataset.field === f;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+  });
+}
+function updateSrcSummary() {
+  const ids = selectedSources();
+  const names = SOURCES.filter(s => ids.includes(s.id)).map(s => s.name);
+  el.srcSummary.textContent = `검색할 DB ${names.length}/${SOURCES.length}개` + (names.length ? ` · ${names.join(', ')}` : ' · 하나 이상 골라줘요');
+}
+el.srcList.addEventListener('change', () => { markField(fieldOf(selectedSources())); updateSrcSummary(); });
 el.fieldChips.addEventListener('click', e => {
   const f = e.target.closest('button[data-field]')?.dataset.field;
   if (!f) return;
-  el.srcList.querySelectorAll('input').forEach(i => { i.checked = SOURCES.find(s => s.id === i.value).fields.includes(f); });
-  saveSources();
+  const ids = sourcesForField(f);
+  el.srcList.querySelectorAll('input').forEach(i => { i.checked = ids.includes(i.value); });
+  markField(f);
+  updateSrcSummary();
 });
 
 /* ---------- 결과 병합 ---------- */
@@ -1033,11 +1060,9 @@ renderTray();
   const m = location.hash.match(/q=([^&]+)/);
   const y = location.hash.match(/[#&]y=(\d{4})?-(\d{4})?/);
   if (y) { el.yearFrom.value = y[1] || ''; el.yearTo.value = y[2] || ''; }
-  // 검색 소스: 링크(s=) > 이전에 고른 것 > 기본값
+  // 검색 소스: 링크에 s=가 있으면 그대로, 없으면 기본값 '전 분야'(모든 DB)
   const sm = location.hash.match(/[#&]s=([a-z,]+)/);
-  let saved = null;
-  try { saved = JSON.parse(localStorage.getItem(SRC_KEY) || 'null'); } catch { /* noop */ }
-  renderSources(sm ? sm[1].split(',') : saved);
+  renderSources(sm ? sm[1].split(',') : null);
   if (m) {
     try { addKeywords(decodeURIComponent(m[1])); } catch { /* noop */ }
     if (state.keywords.length) runSearch();
