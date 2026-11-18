@@ -33,6 +33,12 @@
 | [DOAJ](https://doaj.org) | 전 분야 | 오픈액세스 저널 |
 | [ERIC](https://eric.ed.gov) | 교육학 | 일부 무료 원문 PDF |
 | [CiNii](https://cir.nii.ac.jp) | 전 분야 (일본) | 일본어 키워드 검색 가능 |
+| [AGRICOLA](https://agricola.nal.usda.gov) | 농학·식품·축산 | 미국 농업도서관, Europe PMC 경유 |
+| [OpenAlex](https://openalex.org) 농학 | 농학·생물학 | OpenAlex 중 Agricultural and Biological Sciences 분야만 |
+| [Crossref](https://www.crossref.org) | 전 분야 | DOI 등록 논문, 일부만 초록 |
+| [HAL](https://hal.science) | 전 분야 | 프랑스 오픈 아카이브 (INRAE 등) |
+| [Zenodo](https://zenodo.org) | 전 분야 | 오픈 저장소의 논문·보고서 |
+| [INSPIRE](https://inspirehep.net) | 물리학 | 고에너지·입자물리 |
 | Google Scholar | 전 분야 | 공식 API가 없어 결과는 가져오지 않고, 같은 검색과 논문별 검색 링크만 제공 |
 
 ## 요약 방식
@@ -48,6 +54,10 @@ API 키나 서버가 필요 없어서 GitHub Pages에서 그대로 동작합니�
 - 서버가 없어서 검색어나 고른 논문이 어디에도 저장·수집되지 않습니다. "PDF에 담기" 목록은 사용하는 사람의 브라우저(localStorage)에만 남습니다.
 - 검색어는 고른 검색 소스(Europe PMC, OpenAlex, PubMed, PLOS, DOAJ, ERIC, CiNii)의 공개 API로만 전송됩니다. 키가 필요한 API는 쓰지 않습니다.
 - `.gitignore`로 `.env`, 키 파일, 내보낸 PDF 등이 저장소에 올라가지 않게 막아 두었습니다.
+
+## 비용
+- GitHub Pages(공개 저장소)와 모든 검색 API를 무료로, 키·결제 수단 없이 씁니다. 사용자가 많아도 요금이 생길 수 없습니다.
+- API의 무료 한도는 접속하는 사람(IP)마다 따로 적용됩니다. 한도를 넘으면 API가 요청을 거절할 뿐이고, 사이트는 "사이트 사용 한도 초과" 팝업을 띄우고 그 DB 검색을 멈춥니다.
 
 ## 알아둘 점
 - Europe PMC 본문 서버는 한 건에 10~20초 걸릴 때가 있어 본문 요약이 늦게 뜰 수 있음

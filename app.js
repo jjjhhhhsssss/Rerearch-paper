@@ -60,7 +60,12 @@ async function fetchOk(url) {
     const r = await fetchT(url);
     if (r.ok) return r;
     if ((r.status === 429 || r.status >= 500) && attempt < 2) { await sleep(1500 * (attempt + 1)); continue; }
-    throw new Error(r.status === 429 ? '요청 한도 초과, 잠시 후 다시 검색' : `HTTP ${r.status}`);
+    if (r.status === 429 || r.status === 402) {
+      const e = new Error('무료 사용 한도 초과');
+      e.limit = true; // 한도 초과 표시 → 팝업 띄우고 해당 DB 검색 중단
+      throw e;
+    }
+    throw new Error(`HTTP ${r.status}`);
   }
 }
 const fetchJson = async url => (await fetchOk(url)).json();
@@ -125,7 +130,7 @@ const nextOffset = (offset, got, total, cap = MAX_OFFSET) => {
 };
 
 async function searchEpmc(kw, o, cur) {
-  let q = `"${kw}"`;
+  let q = `"${kw}"` + (o.extraQ || '');
   if (o.oaOnly) q += ' AND OPEN_ACCESS:y';
   if (o.from || o.to) q += ` AND PUB_YEAR:[${o.from || 1800} TO ${o.to || 3000}]`;
   const mark = cur || '*';
@@ -150,7 +155,7 @@ async function searchEpmc(kw, o, cur) {
       cited: r.citedByCount || 0,
       abstractRaw: r.abstractText || '',
       links,
-      source: 'Europe PMC',
+      source: o.label || 'Europe PMC',
     };
   }), data.hitCount, next);
 }
@@ -164,7 +169,7 @@ function invertedToText(inv) {
 
 async function searchOpenAlex(kw, o, cur) {
   const offset = cur || 0;
-  const filters = ['has_abstract:true'];
+  const filters = ['has_abstract:true', ...(o.extraFilter ? [o.extraFilter] : [])];
   if (o.from) filters.push(`from_publication_date:${o.from}-01-01`);
   if (o.to) filters.push(`to_publication_date:${o.to}-12-31`);
   if (o.oaOnly) filters.push('is_oa:true');
@@ -200,7 +205,7 @@ async function searchOpenAlex(kw, o, cur) {
       cited: w.cited_by_count || 0,
       abstractRaw: invertedToText(w.abstract_inverted_index),
       links,
-      source: 'OpenAlex',
+      source: o.label || 'OpenAlex',
     };
   }), data.meta?.count, nextOffset(offset, results.length, data.meta?.count));
 }
@@ -339,6 +344,115 @@ async function searchCinii(kw, o, cur) {
   }), total, nextOffset(offset, items.length, total));
 }
 
+// AGRICOLA (미국 농업도서관 농학 문헌) — Europe PMC에 수록된 AGRICOLA 레코드만 검색
+const searchAgricola = (kw, o, cur) => searchEpmc(kw, { ...o, extraQ: ' AND SRC:AGR', label: 'AGRICOLA' }, cur);
+// OpenAlex 농학 — 주제 분야가 'Agricultural and Biological Sciences'(field 11)인 문헌만
+const searchOpenAlexAgri = (kw, o, cur) => searchOpenAlex(kw, { ...o, extraFilter: 'primary_topic.field.id:11', label: 'OpenAlex 농학' }, cur);
+
+const shortAuthors = a => (a.length > 6 ? a.slice(0, 6).join(', ') + ' 외' : a.join(', '));
+
+// Crossref (전 분야 DOI 메타데이터, 일부 초록 포함)
+async function searchCrossref(kw, o, cur) {
+  const offset = cur || 0;
+  const f = ['type:journal-article', 'type:proceedings-article', 'type:posted-content'];
+  if (o.from) f.push(`from-pub-date:${o.from}`);
+  if (o.to) f.push(`until-pub-date:${o.to}`);
+  const p = new URLSearchParams({
+    query: kw, rows: String(o.size), offset: String(offset), filter: f.join(','),
+    select: 'DOI,title,abstract,author,container-title,issued,is-referenced-by-count,URL,link',
+  });
+  const d = await fetchJson('https://api.crossref.org/works?' + p);
+  const items = d.message?.items || [];
+  const total = d.message?.['total-results'];
+  return paged(items.filter(x => x.title?.[0]).map(x => {
+    const doi = cleanDoi(x.DOI);
+    const authors = (x.author || []).map(a => [a.given, a.family].filter(Boolean).join(' ') || a.name).filter(Boolean);
+    return {
+      title: Summ.htmlToText(x.title[0]), authors: shortAuthors(authors),
+      year: x.issued?.['date-parts']?.[0]?.[0] || null, venue: (x['container-title'] || [])[0] || '',
+      doi, pmcid: '', fulltextAvail: false, isOA: false, cited: x['is-referenced-by-count'] || 0,
+      abstractRaw: Summ.htmlToText(x.abstract || '').replace(/^abstract\s*/i, ''),
+      links: [...doiLink(doi), { label: 'Crossref', url: `https://search.crossref.org/?q=${encodeURIComponent(doi)}` }],
+      source: 'Crossref',
+    };
+  }), total, nextOffset(offset, items.length, total));
+}
+
+// HAL (프랑스 국가 오픈 아카이브, INRAE 등 농학 연구기관 논문 다수)
+async function searchHal(kw, o, cur) {
+  const offset = cur || 0;
+  const p = new URLSearchParams({
+    q: `"${kw}"`, rows: String(o.size), start: String(offset), wt: 'json',
+    fl: 'title_s,abstract_s,authFullName_s,producedDateY_i,doiId_s,uri_s,journalTitle_s,fileMain_s',
+  });
+  if (o.from || o.to) { const [a, b] = yearSpan(o); p.append('fq', `producedDateY_i:[${a} TO ${b}]`); }
+  if (o.oaOnly) p.append('fq', 'submitType_s:file');
+  const d = await fetchJson('https://api.archives-ouvertes.fr/search/?' + p);
+  const docs = d.response?.docs || [];
+  return paged(docs.map(x => {
+    const doi = cleanDoi(x.doiId_s);
+    const pdf = safeUrl(x.fileMain_s);
+    const links = [...doiLink(doi), { label: 'HAL', url: safeUrl(x.uri_s) }].filter(l => l.url);
+    if (pdf) links.push({ label: '무료 원문(PDF)', url: pdf });
+    return {
+      title: Summ.htmlToText((x.title_s || [])[0]), authors: shortAuthors(x.authFullName_s || []),
+      year: x.producedDateY_i || null, venue: x.journalTitle_s || '', doi, pmcid: '', fulltextAvail: false, isOA: !!pdf,
+      cited: 0, abstractRaw: Summ.htmlToText((x.abstract_s || [])[0] || ''), links, source: 'HAL',
+    };
+  }), d.response?.numFound, nextOffset(offset, docs.length, d.response?.numFound));
+}
+
+// Zenodo (CERN 운영 오픈 저장소, 논문·보고서만 검색)
+async function searchZenodo(kw, o, cur) {
+  const offset = cur || 0;
+  const size = Math.min(o.size, 25); // 로그인 없이 한 번에 25건까지
+  let q = `"${kw}"`;
+  if (o.from || o.to) { const [a, b] = yearSpan(o); q += ` AND publication_date:[${a}-01-01 TO ${b}-12-31]`; }
+  if (o.oaOnly) q += ' AND access_right:open';
+  const p = new URLSearchParams({ q, size: String(size), page: String(Math.floor(offset / size) + 1), type: 'publication' });
+  const d = await fetchJson('https://zenodo.org/api/records?' + p);
+  const hits = d.hits?.hits || [];
+  const total = d.hits?.total;
+  return paged(hits.map(h => {
+    const m = h.metadata || {};
+    const doi = cleanDoi(h.doi || m.doi);
+    return {
+      title: Summ.htmlToText(m.title), authors: shortAuthors((m.creators || []).map(c => c.name).filter(Boolean)),
+      year: +(m.publication_date || '').slice(0, 4) || null, venue: m.journal?.title || 'Zenodo', doi, pmcid: '',
+      fulltextAvail: false, isOA: m.access_right === 'open', cited: 0, abstractRaw: Summ.htmlToText(m.description || ''),
+      links: [...doiLink(doi), { label: 'Zenodo', url: safeUrl(h.links?.self_html || `https://zenodo.org/records/${h.id}`) }],
+      source: 'Zenodo',
+    };
+  }), total, nextOffset(offset, hits.length, total));
+}
+
+// INSPIRE-HEP (고에너지·입자물리 문헌)
+async function searchInspire(kw, o, cur) {
+  const offset = cur || 0;
+  let q = `"${kw}"`;
+  if (o.from || o.to) { const [a, b] = yearSpan(o); q += ` and date ${a}->${b}`; }
+  const p = new URLSearchParams({
+    q, size: String(o.size), page: String(Math.floor(offset / o.size) + 1), sort: 'mostrecent',
+    fields: 'titles,abstracts,authors.full_name,dois,publication_info,control_number,earliest_date,arxiv_eprints,citation_count',
+  });
+  const d = await fetchJson('https://inspirehep.net/api/literature?' + p);
+  const hits = d.hits?.hits || [];
+  const total = d.hits?.total;
+  return paged(hits.map(h => {
+    const m = h.metadata || {};
+    const doi = cleanDoi(m.dois?.[0]?.value);
+    const ax = m.arxiv_eprints?.[0]?.value;
+    const links = [...doiLink(doi), { label: 'INSPIRE', url: `https://inspirehep.net/literature/${m.control_number}` }];
+    if (ax) links.push({ label: 'arXiv 원문', url: `https://arxiv.org/abs/${ax}` });
+    return {
+      title: Summ.htmlToText(m.titles?.[0]?.title), authors: shortAuthors((m.authors || []).map(a => a.full_name).filter(Boolean)),
+      year: +(m.earliest_date || '').slice(0, 4) || null, venue: m.publication_info?.[0]?.journal_title || '', doi, pmcid: '',
+      fulltextAvail: false, isOA: !!ax, cited: m.citation_count || 0, abstractRaw: Summ.htmlToText(m.abstracts?.[0]?.value || ''),
+      links, source: 'INSPIRE',
+    };
+  }), total, nextOffset(offset, hits.length, total));
+}
+
 // 분야 목록: 서울대 학술DB 주제 분류 16개('일반'은 '전 분야'로) + 일본 학술자료
 const ALL_FIELDS = ['인문학', '사회과학', '경영학', '법학', '교육학', '예술', '자연과학', '공학', '생명과학', '농생명과학', '의학', '약학', '간호학', '치의학', '수의학'];
 const FIELD_ORDER = ['전 분야', ...ALL_FIELDS, '일본 학술자료'];
@@ -354,6 +468,18 @@ const SOURCES = [
   { id: 'eric', name: 'ERIC', fn: searchEric, note: '교육학 저널·보고서 (미국 교육부)', fields: ['교육학', '사회과학'] },
   { id: 'cinii', name: 'CiNii', fn: searchCinii, note: '일본 학술 논문·학위논문 (일본어 검색 가능)',
     fields: ['전 분야', ...ALL_FIELDS.filter(f => f !== '간호학'), '일본 학술자료'] },
+  { id: 'agricola', name: 'AGRICOLA', fn: searchAgricola, note: '미국 농업도서관 농학·식품·축산 문헌 (Europe PMC 경유)',
+    fields: ['농생명과학', '생명과학', '수의학'] },
+  { id: 'oaagri', name: 'OpenAlex 농학', fn: searchOpenAlexAgri, note: 'OpenAlex 중 농학·생물학(Agricultural and Biological Sciences) 분야만',
+    fields: ['농생명과학', '생명과학'] },
+  { id: 'crossref', name: 'Crossref', fn: searchCrossref, note: '전 분야 DOI 등록 논문 (일부 초록 포함, 키워드 일치는 느슨함)',
+    fields: ['전 분야', ...ALL_FIELDS] },
+  { id: 'hal', name: 'HAL', fn: searchHal, note: '프랑스 국가 오픈 아카이브 (INRAE 등 농학 연구기관 논문 다수)',
+    fields: ['전 분야', ...ALL_FIELDS] },
+  { id: 'zenodo', name: 'Zenodo', fn: searchZenodo, note: 'CERN 운영 오픈 저장소의 논문·보고서',
+    fields: ['전 분야', '자연과학', '공학', '생명과학', '농생명과학', '사회과학', '인문학'] },
+  { id: 'inspire', name: 'INSPIRE', fn: searchInspire, note: '물리학(고에너지·입자물리) 문헌',
+    fields: ['자연과학', '공학'] },
 ];
 
 // 분야 버튼을 누르면 그 분야를 다루는 DB만 체크한다. '전 분야'는 모든 DB.
@@ -475,6 +601,8 @@ async function runSearch() {
   // 소스×키워드마다 "피드"를 만들어 두고, 처음 한 묶음을 받는다. 나머지는 페이지를 넘길 때 이어서 받는다.
   state.searchOpts = o;
   state.feeds = [];
+  limitHit.clear();
+  limitShown.clear();
   for (const s of SOURCES.filter(x => srcIds.includes(x.id))) {
     for (const kw of kws) state.feeds.push({ s, kw, cur: undefined, loaded: 0, total: 0, done: false, fails: 0, err: '' });
   }
@@ -503,17 +631,32 @@ async function fetchBatch(seq) {
         f.err = '';
       } catch (err) {
         f.err = err.message;
-        if (++f.fails >= 2) f.done = true; // 두 번 실패하면 그 피드는 그만 받는다
+        if (err.limit) { f.done = true; limitHit.add(f.s.name); } // 한도 초과면 즉시 그 DB 중단
+        else if (++f.fails >= 2) f.done = true; // 두 번 실패하면 그 피드는 그만 받는다
       }
     }
   }));
   if (seq !== searchSeq) return;
   state.lastErrors = state.feeds.filter(f => f.err).map(f => `${f.s.name} "${f.kw}" 실패(${f.err})`);
+  showLimitPopup();
   // 새로 들어온 논문만 DOI로 PMC 본문 조회 (앞선 조회와 이어서)
   const prev = state.doiLookup;
   const fresh = [...state.papers.values()].filter(p => !p.doiChecked);
   fresh.forEach(p => { p.doiChecked = true; });
   state.doiLookup = Promise.all([prev, lookupPmcByDoi(fresh)]);
+}
+
+// 무료 사용 한도 초과 팝업. 이 사이트는 결제 수단·API 키가 없어서 한도를 넘어도 요금이 생기지 않고,
+// 해당 DB가 요청을 거절할 뿐이다. 거절되면 그 DB 검색을 멈추고 안내한다.
+const limitHit = new Set();
+const limitShown = new Set();
+function showLimitPopup() {
+  const fresh = [...limitHit].filter(n => !limitShown.has(n));
+  if (!fresh.length) return;
+  fresh.forEach(n => limitShown.add(n));
+  const dlg = document.getElementById('limitDialog');
+  dlg.querySelector('.limit-dbs').textContent = [...limitHit].join(', ');
+  if (dlg.showModal) dlg.showModal(); else alert('사이트 사용 한도 초과: ' + [...limitHit].join(', '));
 }
 
 const hasMore = () => !!state.feeds?.some(f => !f.done);
