@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>선행연구 논문 검색</title>
+<meta name="description" content="키워드로 선행연구 논문을 찾고 Results·Discussion 요약을 모아 PDF로 내보내는 도구">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <h1>선행연구 논문 검색</h1>
+    <p class="sub">키워드를 넣으면 하나라도 포함된 논문을 찾고, Results·Discussion 핵심 문장을 뽑아 보여줘요.</p>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="panel" aria-label="검색">
+    <form id="searchForm" autocomplete="off">
+      <label class="lbl" for="kwInput">키워드 <span class="hint">(Enter 또는 쉼표로 추가, 최대 5개 · 영어 키워드 권장)</span></label>
+      <div class="kw-box" id="kwBox">
+        <div id="kwChips" class="kw-chips"></div>
+        <input id="kwInput" type="text" placeholder="예: quality control, defect detection, machine vision">
+      </div>
+
+      <div class="opts">
+        <fieldset>
+          <legend>검색 소스</legend>
+          <label><input type="checkbox" id="srcEpmc" checked> Europe PMC</label>
+          <label><input type="checkbox" id="srcOa" checked> OpenAlex</label>
+        </fieldset>
+        <label class="opt">발행 연도
+          <input type="number" id="yearFrom" min="1900" max="2100" placeholder="2015"> 년 이후
+        </label>
+        <label class="opt">키워드·소스당
+          <select id="size">
+            <option value="10">10건</option>
+            <option value="25" selected>25건</option>
+            <option value="50">50건</option>
+          </select>
+        </label>
+        <label class="opt"><input type="checkbox" id="oaOnly"> 오픈액세스만</label>
+      </div>
+
+      <div class="actions">
+        <button type="submit" class="btn primary" id="searchBtn">검색</button>
+        <a id="scholarLink" class="btn ghost" href="https://scholar.google.com/" target="_blank" rel="noopener">Google Scholar에서 같은 검색 열기 ↗</a>
+      </div>
+    </form>
+  </section>
+
+  <section id="resultsArea" hidden>
+    <div class="toolbar">
+      <div class="filter-row">
+        <span class="lbl-inline">키워드 필터</span>
+        <div id="filterChips" class="filter-chips" role="group" aria-label="키워드 필터"></div>
+      </div>
+      <div class="ctrl-row">
+        <div class="seg" role="group" aria-label="보기 방식">
+          <button type="button" data-view="merged" class="on">합쳐서 보기</button>
+          <button type="button" data-view="split">키워드별로 나눠 보기</button>
+        </div>
+        <div class="seg" role="group" aria-label="일치 조건" id="matchSeg">
+          <button type="button" data-match="any" class="on">하나라도 포함</button>
+          <button type="button" data-match="all">모두 포함</button>
+        </div>
+        <label class="opt"><input type="checkbox" id="titleOnly"> 제목에 포함된 것만</label>
+        <label class="opt">정렬
+          <select id="sort">
+            <option value="relevance">관련도</option>
+            <option value="kwcount">포함 키워드 많은 순</option>
+            <option value="year">최신순</option>
+            <option value="cited">피인용 많은 순</option>
+          </select>
+        </label>
+      </div>
+    </div>
+    <p id="status" class="status" role="status"></p>
+    <div id="results"></div>
+  </section>
+
+  <section id="emptyState" class="empty">
+    <p>키워드를 입력하고 검색해 봐요. 결과 카드의 <b>PDF에 담기</b>를 체크하면 원하는 요약만 모아서 PDF로 내보낼 수 있어요.</p>
+    <p class="note">요약은 AI 생성이 아니라 논문 본문(오픈액세스) 또는 초록에서 키워드·수치·결론 표현이 들어간 핵심 문장을 골라낸 거예요. 인용 전에는 원문을 꼭 확인해요.</p>
+  </section>
+</main>
+
+<div id="tray" class="tray" hidden>
+  <div class="wrap tray-inner">
+    <button type="button" class="btn ghost" id="trayToggle" aria-expanded="false">담은 논문 <b id="trayCount">0</b>개</button>
+    <div class="tray-actions">
+      <button type="button" class="btn ghost" id="clearSel">비우기</button>
+      <button type="button" class="btn primary" id="exportPdf">PDF로 내보내기</button>
+    </div>
+  </div>
+  <div class="wrap tray-list" id="trayList" hidden></div>
+</div>
+
+<footer class="foot wrap">
+  데이터: <a href="https://europepmc.org" target="_blank" rel="noopener">Europe PMC</a> ·
+  <a href="https://openalex.org" target="_blank" rel="noopener">OpenAlex</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+<script src="summarize.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,27 @@
+# 민감 정보 (키·비밀번호·인증서) — 절대 올리지 않음
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+*secret*
+*credential*
+*password*
+*token*
+config.local.*
+
+# 개인 작업·도구 설정
+.claude/
+.vscode/
+.idea/
+*.log
+
+# 내보낸 결과물 (개인 검색 기록이 담길 수 있음)
+*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
